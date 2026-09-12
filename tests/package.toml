@@ -1,0 +1,22 @@
+[package]
+package_id = "org.rinos.rinpack-test"
+display_name = "Rinpack Test"
+version = "1.2.3"
+architecture = "any"
+package_type = "application"
+description = "Native package builder test."
+license = "MIT"
+homepage = "https://example.invalid/rinpack"
+min_rinos_version = "1.0"
+max_rinos_version = ""
+dependencies = [{name = "org.rinos.base", min_version = "1.0", max_version = "2.0"}]
+optional_dependencies = []
+conflicts = []
+provides = ["test-package"]
+entry_points = [{name = "main", path = "bin/main.rin"}]
+flags = ["security"]
+capabilities = ["gui-control"]
+
+[[files]]
+path = "bin/main.rin"
+source = "main.rin"
