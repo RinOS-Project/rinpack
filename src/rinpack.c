@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /* Native RinOS .rpk package builder and verifier. */
 
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
@@ -26,6 +30,8 @@
 #define strtok_s strtok_s
 typedef struct _stat RinStat;
 #define rin_stat _stat
+#define resolve_full_path _fullpath
+#define rin_stat_is_regular(stat_value) (((stat_value).st_mode & _S_IFREG) != 0)
 #else
 #include <unistd.h>
 #include <strings.h>
@@ -34,6 +40,7 @@ typedef struct _stat RinStat;
 #define strtok_s strtok_r
 typedef struct stat RinStat;
 #define rin_stat stat
+#define rin_stat_is_regular(stat_value) S_ISREG((stat_value).st_mode)
 #endif
 
 #define PKG_MAGIC UINT32_C(0x474b5052)
@@ -78,6 +85,25 @@ typedef struct {
     size_t size;
     size_t capacity;
 } Buffer;
+
+#ifndef _WIN32
+static char *resolve_full_path(char *destination, const char *path,
+                               size_t destination_size) {
+    char *resolved;
+    size_t length;
+    if (!destination || !path || destination_size == 0u) return NULL;
+    resolved = realpath(path, NULL);
+    if (!resolved) return NULL;
+    length = strlen(resolved);
+    if (length + 1u > destination_size) {
+        free(resolved);
+        return NULL;
+    }
+    memcpy(destination, resolved, length + 1u);
+    free(resolved);
+    return destination;
+}
+#endif
 
 typedef struct {
     char name[PKG_NAME_MAX];
@@ -575,7 +601,7 @@ static int parse_manifest(const char *path, Manifest *manifest) {
     char *slash;
     size_t index;
     memset(manifest, 0, sizeof(*manifest));
-    if (!path || !_fullpath(full_path, path, sizeof(full_path))) return failf2("manifest path is invalid", path);
+    if (!path || !resolve_full_path(full_path, path, sizeof(full_path))) return failf2("manifest path is invalid", path);
     memcpy(manifest->root, full_path, strlen(full_path) + 1u);
     slash = strrchr(manifest->root, '/');
     {
@@ -740,12 +766,12 @@ static int validate_manifest(Manifest *manifest) {
         if (canonical_relative(manifest->files[index].path, "files.path", 0) != 0 ||
             copy_text(manifest->files[index].source, sizeof(manifest->files[index].source), manifest->files[index].source, "files.source", 0) != 0) return -1;
         for (other = 0; other < index; ++other) if (strcmp(manifest->files[index].path, manifest->files[other].path) == 0) return failf("duplicate package destination path");
-        if (snprintf(source_path, sizeof(source_path), "%s/%s", manifest->root, manifest->files[index].source) >= (int)sizeof(source_path) || !_fullpath(resolved, source_path, sizeof(resolved))) return failf("source path is too long");
+        if (snprintf(source_path, sizeof(source_path), "%s/%s", manifest->root, manifest->files[index].source) >= (int)sizeof(source_path) || !resolve_full_path(resolved, source_path, sizeof(resolved))) return failf("source path is too long");
         {
             size_t root_length = strlen(manifest->root);
             if (strlen(resolved) <= root_length || strncasecmp(resolved, manifest->root, root_length) != 0 || (resolved[root_length] != '/' && resolved[root_length] != '\\')) return failf("file source escapes manifest directory");
         }
-        if (source_is_link(resolved) || rin_stat(resolved, &st) != 0 || (st.st_mode & S_IFREG) == 0) return failf2("source is not a regular non-symlink file", resolved);
+        if (source_is_link(resolved) || rin_stat(resolved, &st) != 0 || !rin_stat_is_regular(st)) return failf2("source is not a regular non-symlink file", resolved);
         if ((uint64_t)st.st_size > PKG_MAX_FILE_SIZE) return failf2("source exceeds per-file limit", resolved);
         manifest->files[index].data = (uint8_t *)malloc(st.st_size ? (size_t)st.st_size : 1u);
         manifest->files[index].size = (size_t)st.st_size;
