@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: Apache-2.0 */
 /* Native RinOS .rpk package builder and verifier. */
 
 #ifndef _WIN32

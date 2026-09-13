@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -O2
 LDLIBS ?= -lcrypto -lz
