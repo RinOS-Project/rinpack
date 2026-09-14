@@ -29,6 +29,7 @@
 *.dylib
 
 # Executables
+/rinpack
 *.exe
 *.out
 *.app
