@@ -52,6 +52,7 @@ typedef struct stat RinStat;
 #define PKG_FLAG_SIGNED 1u
 #define PKG_MAX_FILES 64u
 #define PKG_MAX_DEPS 8u
+#define PKG_MAX_CAPABILITIES 31u
 #define PKG_MAX_TOTAL_SIZE (256u * 1024u * 1024u)
 #define PKG_MAX_FILE_SIZE (32u * 1024u * 1024u)
 #define PKG_PATH_MAX 192u
@@ -77,7 +78,7 @@ typedef struct stat RinStat;
 #define RIN_IMAGE_EXECUTABLE UINT32_C(1)
 
 #define MAX_LINE 8192u
-#define MAX_ARRAY_ITEMS 16u
+#define MAX_ARRAY_ITEMS PKG_MAX_CAPABILITIES
 #define MAX_INLINE_VALUE 512u
 
 typedef struct {
@@ -137,7 +138,7 @@ typedef struct {
     char max_rinos_version[PKG_VERSION_MAX];
     char flags[3][32];
     size_t flag_count;
-    char capabilities[9][32];
+    char capabilities[PKG_MAX_CAPABILITIES][32];
     size_t capability_count;
     char conflicts[PKG_MAX_DEPS][PKG_NAME_MAX];
     size_t conflict_count;
@@ -563,7 +564,9 @@ static int set_package_field(Manifest *manifest, unsigned *seen, const char *key
     if (strcmp(key, "flags") == 0)
         return parse_string_array(value, manifest->flags, 3u, &manifest->flag_count, key);
     if (strcmp(key, "capabilities") == 0)
-        return parse_string_array(value, manifest->capabilities, 9u, &manifest->capability_count, key);
+        return parse_string_array(value, manifest->capabilities,
+                                  PKG_MAX_CAPABILITIES,
+                                  &manifest->capability_count, key);
     if (parse_string_token(value, parsed, sizeof(parsed), key) != 0) return -1;
     if (strcmp(key, "package_id") == 0) return copy_text(manifest->package_id, sizeof(manifest->package_id), parsed, key, 0);
     if (strcmp(key, "display_name") == 0) return copy_text(manifest->display_name, sizeof(manifest->display_name), parsed, key, 0);
@@ -737,7 +740,15 @@ static int source_is_link(const char *path) {
 static int validate_manifest(Manifest *manifest) {
     size_t index;
     size_t other;
-    const char *capabilities[] = {"dac-override", "chown", "system-admin", "driver-broker", "service-control", "gui-control", "process-control", "network-admin", "crash-diagnostic"};
+    static const char *capabilities[] = {
+        "dac-override", "chown", "system-admin", "driver-broker",
+        "service-control", "gui-control", "process-control", "network-admin",
+        "crash-diagnostic", "storage-manage", "package-manage", "rin-pass",
+        "keyring-master", "power-control", "system-info", "network-access",
+        "clipboard", "notification", "gpu-access", "microphone", "camera",
+        "midi", "location", "file-portal", "theme-control", "accessibility",
+        "display", "desktop", "audio-output", "debugging", "profiling",
+    };
     const char *flags[] = {"system", "reboot-required", "security"};
     if (canonical_name(manifest->package_id, "package_id") != 0 ||
         canonical_version(manifest->version, "version", 0) != 0 ||
@@ -755,7 +766,8 @@ static int validate_manifest(Manifest *manifest) {
     }
     for (index = 0; index < manifest->capability_count; ++index) {
         size_t found = 0;
-        for (other = 0; other < 9u; ++other) if (strcmp(manifest->capabilities[index], capabilities[other]) == 0) found = 1;
+        for (other = 0; other < sizeof(capabilities) / sizeof(capabilities[0]); ++other)
+            if (strcmp(manifest->capabilities[index], capabilities[other]) == 0) found = 1;
         if (!found) return failf2("unknown capability", manifest->capabilities[index]);
         for (other = 0; other < index; ++other) if (strcmp(manifest->capabilities[index], manifest->capabilities[other]) == 0) return failf("duplicate capability");
     }
@@ -892,7 +904,15 @@ static int make_dependency_metadata(const Manifest *manifest, Buffer *out) {
 }
 
 static uint64_t capability_bit(const char *name) {
-    static const char *names[] = {"dac-override", "chown", "system-admin", "driver-broker", "service-control", "gui-control", "process-control", "network-admin", "crash-diagnostic"};
+    static const char *names[] = {
+        "dac-override", "chown", "system-admin", "driver-broker",
+        "service-control", "gui-control", "process-control", "network-admin",
+        "crash-diagnostic", "storage-manage", "package-manage", "rin-pass",
+        "keyring-master", "power-control", "system-info", "network-access",
+        "clipboard", "notification", "gpu-access", "microphone", "camera",
+        "midi", "location", "file-portal", "theme-control", "accessibility",
+        "display", "desktop", "audio-output", "debugging", "profiling",
+    };
     size_t index;
     for (index = 0; index < sizeof(names) / sizeof(names[0]); ++index) if (strcmp(name, names[index]) == 0) return UINT64_C(1) << index;
     return 0;

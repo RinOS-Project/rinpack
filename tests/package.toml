@@ -15,7 +15,7 @@ conflicts = []
 provides = ["test-package"]
 entry_points = [{name = "main", path = "bin/main.rin"}]
 flags = ["security"]
-capabilities = ["gui-control"]
+capabilities = ["dac-override", "chown", "system-admin", "driver-broker", "service-control", "gui-control", "process-control", "network-admin", "crash-diagnostic", "storage-manage", "package-manage", "rin-pass", "keyring-master", "power-control", "system-info", "network-access", "clipboard", "notification", "gpu-access", "microphone", "camera", "midi", "location", "file-portal", "theme-control", "accessibility", "display", "desktop", "audio-output", "debugging", "profiling"]
 
 [[files]]
 path = "bin/main.rin"
