@@ -49,6 +49,7 @@ typedef struct stat RinStat;
 #define PKG_VERSION_UNSIGNED 1u
 #define PKG_VERSION_SIGNED 2u
 #define PKG_VERSION_PUBLISHER_SIGNED 3u
+#define PKG_VERSION_PRODUCTION_SIGNED 4u
 #define PKG_FLAG_SIGNED 1u
 #define PKG_MAX_FILES 64u
 #define PKG_MAX_DEPS 8u
@@ -776,6 +777,7 @@ static int validate_manifest(Manifest *manifest) {
         char resolved[2048];
         RinStat st;
         if (canonical_relative(manifest->files[index].path, "files.path", 0) != 0 ||
+            strlen(manifest->files[index].path) >= PKG_NAME_MAX ||
             copy_text(manifest->files[index].source, sizeof(manifest->files[index].source), manifest->files[index].source, "files.source", 0) != 0) return -1;
         for (other = 0; other < index; ++other) if (strcmp(manifest->files[index].path, manifest->files[other].path) == 0) return failf("duplicate package destination path");
         if (snprintf(source_path, sizeof(source_path), "%s/%s", manifest->root, manifest->files[index].source) >= (int)sizeof(source_path) || !resolve_full_path(resolved, source_path, sizeof(resolved))) return failf("source path is too long");
@@ -1160,9 +1162,11 @@ static int validate_package(const Buffer *package, size_t *data_offset, size_t *
     uint32_t total;
     size_t index;
     size_t end_max = 0;
+    int has_file_identity = 0;
+    int has_manifest = 0;
     if (package->size < PKG_HEADER_SIZE) return failf("package is shorter than its header");
     if (get32(header, 0) != PKG_MAGIC) return failf("package magic is invalid");
-    if (get16(header, 4) < 1u || get16(header, 4) > 3u) return failf("package version is invalid");
+    if (get16(header, 4) < 1u || get16(header, 4) > PKG_VERSION_PRODUCTION_SIGNED) return failf("package version is invalid");
     if (get16(header, 6) > 3u) return failf("package type is invalid");
     if (!header_crc_valid(header)) return failf("package header CRC32 is invalid");
     if (canonical_field(header + 8, 64, 0) != 0) return failf("package name is invalid");
@@ -1183,6 +1187,8 @@ static int validate_package(const Buffer *package, size_t *data_offset, size_t *
         if (path_length == PKG_PATH_MAX || canonical_relative((const char *)entry, "package entry path", 1) != 0 || (get16(entry, 204) != 0u && get16(entry, 204) != PKG_FILE_FLAG_METADATA)) return -1;
         for (size_t reserved = 206u; reserved < PKG_ENTRY_SIZE; ++reserved) if (entry[reserved]) return failf("package entry reserved bytes are not zero");
         if (strncmp((const char *)entry, ".rinpkg/", 8u) == 0 && get16(entry, 204) == 0u) return failf("reserved package entry is not metadata");
+        if (get16(entry, 204) != 0u && strcmp((const char *)entry, ".rinpkg/file-identities.rfim") == 0) has_file_identity = 1;
+        if (get16(entry, 204) != 0u && strcmp((const char *)entry, ".rinpkg/manifest.rman") == 0) has_manifest = 1;
         offset = get32(entry, 192); size = get32(entry, 196);
         if ((uint64_t)offset + size > total || (uint64_t)*data_offset + offset + size > package->size) return failf("package entry exceeds payload");
         if (crc32_bytes(package->data + *data_offset + offset, size) != get32(entry, 200)) return failf("package entry CRC32 is invalid");
@@ -1195,13 +1201,15 @@ static int validate_package(const Buffer *package, size_t *data_offset, size_t *
         }
     }
     if (end_max != total) return failf("package payload is not dense");
+    if (get16(header, 4) == PKG_VERSION_PRODUCTION_SIGNED &&
+        (!has_file_identity || !has_manifest)) return failf("production package evidence is incomplete");
     if (get16(header, 4) == PKG_VERSION_UNSIGNED) {
         if (get32(header, 176) || get64(header, 184) || get32(header, 192) || get32(header, 196) || package->size != *data_offset + total) return failf("unsigned package contains signed metadata");
     } else {
         uint64_t signature_offset = get64(header, 184);
         uint32_t signature_size = get32(header, 192);
         if (get32(header, 176) != PKG_FLAG_SIGNED || get32(header, 196) != 0u || signature_offset != *data_offset + total || signature_size < 48u || signature_offset + signature_size != package->size) return failf("signed package layout is invalid");
-        if (get16(header, 4) == PKG_VERSION_PUBLISHER_SIGNED && (get32(header, 232) == 0u || !memcmp(header + 200, (const uint8_t[32]){0}, 32))) return failf("publisher identity is invalid");
+        if ((get16(header, 4) == PKG_VERSION_PUBLISHER_SIGNED || get16(header, 4) == PKG_VERSION_PRODUCTION_SIGNED) && (get32(header, 232) == 0u || !memcmp(header + 200, (const uint8_t[32]){0}, 32))) return failf("publisher identity is invalid");
     }
     *file_count = count;
     return 0;
@@ -1269,7 +1277,7 @@ static int sign_package(Buffer *image, const char *private_path, const char *pub
     RSA_free(trusted_rsa); trusted_rsa = NULL;
     if (public_der_matches(private_key, &public_der) != 0 || digest_sign(private_key, image->data, image->size, &probe, &probe_size) != 0 || probe_size < 256u || probe_size > 512u) goto error;
     EVP_Digest(public_der.data, public_der.size, key_id, NULL, EVP_sha256(), NULL);
-    put16(image->data, 4, generation ? PKG_VERSION_PUBLISHER_SIGNED : PKG_VERSION_SIGNED);
+    put16(image->data, 4, PKG_VERSION_PRODUCTION_SIGNED);
     put32(image->data, 176, PKG_FLAG_SIGNED);
     put64(image->data, 184, image->size);
     put32(image->data, 192, (uint32_t)(48u + probe_size));
@@ -1429,6 +1437,7 @@ static int build_command(const Options *options) {
     if (!options->manifest || !options->output) return failf("create requires --manifest and --output");
     if ((options->sign_key == NULL) != (options->public_key == NULL)) return failf("--sign-key and --public-key must be supplied together");
     if (options->generation_set && (!signed_package || options->publisher_generation == 0u)) return failf("publisher generation requires a positive signing identity");
+    if (signed_package && (!options->generation_set || options->publisher_generation == 0u)) return failf("production packages require a publisher generation");
     if (parse_manifest(options->manifest, &manifest) != 0 || validate_manifest(&manifest) != 0) goto done;
     qsort(manifest.files, manifest.file_count, sizeof(manifest.files[0]), compare_file);
     qsort(manifest.dependencies, manifest.dependency_count, sizeof(manifest.dependencies[0]), compare_dependency);
@@ -1474,7 +1483,7 @@ static int verify_command(const Options *options) {
     size_t data_offset, count;
     if (!options->package || !options->public_key) return failf("verify requires --package and --public-key");
     if (read_file(options->package, &package) != 0 || validate_package(&package, &data_offset, &count) != 0) { buffer_free(&package); return -1; }
-    if (get16(package.data, 4) == PKG_VERSION_UNSIGNED || verify_signature(&package, options->public_key) != 0) { buffer_free(&package); return failf("package is not production-authenticated"); }
+    if (get16(package.data, 4) != PKG_VERSION_PRODUCTION_SIGNED || verify_signature(&package, options->public_key) != 0) { buffer_free(&package); return failf("package is not production-authenticated"); }
     if (options->json) printf("{\"format\":\".rpk\",\"verified\":true,\"file_count\":%llu}\n", (unsigned long long)count);
     else printf("verified %s\n", options->package);
     buffer_free(&package);
