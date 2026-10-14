@@ -1438,7 +1438,7 @@ static int make_file_identity_metadata(const Manifest *manifest, Buffer *out) {
         put64(record, 192, manifest->files[index].size);
         if (checked_sha256(manifest->files[index].data,
                            manifest->files[index].size, digest) != 0)
-            goto error;
+            return -1;
         memcpy(record + 200, digest, sizeof(digest));
         if (manifest->files[index].size >= RIN_IMAGE_HEADER_SIZE && get32(manifest->files[index].data, 0) == RIN_IMAGE_MAGIC && get32(manifest->files[index].data, 4) == RIN_IMAGE_VERSION_V3 && get16(manifest->files[index].data, 8) == RIN_IMAGE_HEADER_SIZE && (get32(manifest->files[index].data, 16) & RIN_IMAGE_EXECUTABLE) != 0u)
             memcpy(record + 232, manifest->files[index].data + 116, 32);
