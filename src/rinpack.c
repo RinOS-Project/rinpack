@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <zlib.h>
 
@@ -28,19 +29,13 @@
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
 #define strtok_s strtok_s
-typedef struct _stat RinStat;
-#define rin_stat _stat
 #define resolve_full_path _fullpath
-#define rin_stat_is_regular(stat_value) (((stat_value).st_mode & _S_IFREG) != 0)
 #else
 #include <unistd.h>
 #include <strings.h>
 #define mkdir_one(path) mkdir(path, 0777)
 #define unlink_file unlink
 #define strtok_s strtok_r
-typedef struct stat RinStat;
-#define rin_stat stat
-#define rin_stat_is_regular(stat_value) S_ISREG((stat_value).st_mode)
 #endif
 
 #define PKG_MAGIC UINT32_C(0x474b5052)
@@ -127,6 +122,15 @@ typedef struct {
 } PackageFile;
 
 typedef struct {
+#ifdef _WIN32
+    HANDLE handle;
+    char path[2048];
+#else
+    int descriptor;
+#endif
+} PackageSourceRoot;
+
+typedef struct {
     char package_id[PKG_NAME_MAX];
     char display_name[PKG_DISPLAY_NAME_MAX];
     char version[PKG_VERSION_MAX];
@@ -154,7 +158,13 @@ typedef struct {
     PackageFile files[PKG_MAX_FILES];
     size_t file_count;
     char root[1024];
+    PackageSourceRoot source_root;
 } Manifest;
+
+static int source_root_open(PackageSourceRoot *root, const char *path);
+static FILE *source_open_manifest_stream(PackageSourceRoot *root,
+                                         const char *manifest_name);
+static int source_root_close(PackageSourceRoot *root);
 
 typedef struct {
     char path[PKG_PATH_MAX];
@@ -180,6 +190,19 @@ static int failf(const char *message) {
 static int failf2(const char *prefix, const char *value) {
     fprintf(stderr, "rinpack: %s: %s\n", prefix, value);
     return -1;
+}
+
+static int checked_sha256(const void *data, size_t size, uint8_t output[32])
+{
+    unsigned int output_size = 0u;
+    if (!output || (!data && size != 0u))
+        return failf("SHA-256 input or output is invalid");
+    if (EVP_Digest(data, size, output, &output_size, EVP_sha256(), NULL) != 1 ||
+        output_size != 32u) {
+        memset(output, 0, 32u);
+        return failf("SHA-256 digest failed or returned an invalid length");
+    }
+    return 0;
 }
 
 static void buffer_free(Buffer *buffer) {
@@ -603,8 +626,15 @@ static int parse_manifest(const char *path, Manifest *manifest) {
     PackageFile *current_file = NULL;
     char full_path[1024];
     char *slash;
+    char *path_separator;
+    const char *manifest_name;
     size_t index;
     memset(manifest, 0, sizeof(*manifest));
+#ifdef _WIN32
+    manifest->source_root.handle = INVALID_HANDLE_VALUE;
+#else
+    manifest->source_root.descriptor = -1;
+#endif
     if (!path || !resolve_full_path(full_path, path, sizeof(full_path))) return failf2("manifest path is invalid", path);
     memcpy(manifest->root, full_path, strlen(full_path) + 1u);
     slash = strrchr(manifest->root, '/');
@@ -613,8 +643,29 @@ static int parse_manifest(const char *path, Manifest *manifest) {
         if (!slash || (backslash && backslash > slash)) slash = backslash;
     }
     if (!slash) return failf2("manifest has no parent directory", path);
-    *slash = '\0';
-    stream = fopen(full_path, "rb");
+#ifdef _WIN32
+    if (slash == manifest->root + 2u && manifest->root[1] == ':')
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+#else
+    if (slash == manifest->root)
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+#endif
+    path_separator = strrchr(full_path, '/');
+    {
+        char *backslash = strrchr(full_path, '\\');
+        if (!path_separator || (backslash && backslash > path_separator))
+            path_separator = backslash;
+    }
+    if (!path_separator || !path_separator[1])
+        return failf2("manifest has no file name", path);
+    manifest_name = path_separator + 1u;
+    if (source_root_open(&manifest->source_root, manifest->root) != 0)
+        return -1;
+    stream = source_open_manifest_stream(&manifest->source_root, manifest_name);
     if (!stream) return failf2("cannot open manifest", path);
     while (fgets(line, sizeof(line), stream)) {
         char *content;
@@ -727,16 +778,451 @@ static int version_compare(const char *left, const char *right) {
     return 0;
 }
 
-static int source_is_link(const char *path) {
 #ifdef _WIN32
-    DWORD attributes = GetFileAttributesA(path);
-    return attributes != INVALID_FILE_ATTRIBUTES &&
-           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+static int source_handle_path(HANDLE handle, char *path, size_t capacity)
+{
+    DWORD length;
+    if (!handle || handle == INVALID_HANDLE_VALUE || !path || capacity == 0u ||
+        capacity > UINT32_MAX)
+        return -1;
+    length = GetFinalPathNameByHandleA(handle, path, (DWORD)capacity,
+                                       FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (length == 0u || (size_t)length >= capacity) return -1;
+    return 0;
+}
+
+static int source_path_is_beneath(const char *root, const char *path)
+{
+    size_t root_length;
+    size_t path_length;
+    if (!root || !path) return 0;
+    root_length = strlen(root);
+    while (root_length > 4u &&
+           (root[root_length - 1u] == '\\' || root[root_length - 1u] == '/'))
+        --root_length;
+    path_length = strlen(path);
+    return path_length > root_length &&
+           strncasecmp(root, path, root_length) == 0 &&
+           (path[root_length] == '\\' || path[root_length] == '/');
+}
+
+static int source_append_component(char *path, size_t capacity,
+                                   const char *base, const char *component)
+{
+    const size_t length = strlen(base);
+    const char separator = length != 0u &&
+                                   (base[length - 1u] == '\\' ||
+                                    base[length - 1u] == '/')
+                               ? '\0'
+                               : '\\';
+    int written = separator == '\0'
+        ? snprintf(path, capacity, "%s%s", base, component)
+        : snprintf(path, capacity, "%s%c%s", base, separator, component);
+    return written < 0 || (size_t)written >= capacity ? -1 : 0;
+}
 #else
-    struct stat st;
-    return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+static int source_open_directory_path(const char *path)
+{
+    char copy[1024];
+    const size_t length = path ? strlen(path) : 0u;
+    int current;
+    char *component;
+    if (length == 0u || length >= sizeof(copy) || path[0] != '/') return -1;
+    current = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (current < 0 || strcmp(path, "/") == 0) return current;
+    memcpy(copy, path + 1u, length);
+    copy[length - 1u] = '\0';
+    component = copy;
+    while (*component) {
+        char *separator = strchr(component, '/');
+        int next;
+        if (separator) *separator = '\0';
+        if (!*component || strcmp(component, ".") == 0 ||
+            strcmp(component, "..") == 0) {
+            (void)close(current);
+            return -1;
+        }
+        next = openat(current, component,
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        (void)close(current);
+        if (next < 0) return -1;
+        current = next;
+        if (!separator) break;
+        component = separator + 1u;
+    }
+    return current;
+}
+#endif
+
+static int source_root_open(PackageSourceRoot *root, const char *path)
+{
+    if (!root || !path) return failf("source root is invalid");
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION info;
+    memset(root, 0, sizeof(*root));
+    root->handle = CreateFileA(path, FILE_READ_ATTRIBUTES,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS |
+                                   FILE_FLAG_OPEN_REPARSE_POINT,
+                               NULL);
+    if (root->handle == INVALID_HANDLE_VALUE ||
+        !GetFileInformationByHandle(root->handle, &info) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0u ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u ||
+        source_handle_path(root->handle, root->path, sizeof(root->path)) != 0) {
+        if (root->handle != INVALID_HANDLE_VALUE) CloseHandle(root->handle);
+        root->handle = INVALID_HANDLE_VALUE;
+        return failf2("cannot open manifest source root", path);
+    }
+#else
+    struct stat info;
+    root->descriptor = source_open_directory_path(path);
+    if (root->descriptor < 0 || fstat(root->descriptor, &info) != 0 ||
+        !S_ISDIR(info.st_mode)) {
+        if (root->descriptor >= 0) (void)close(root->descriptor);
+        root->descriptor = -1;
+        return failf2("cannot open manifest source root", path);
+    }
+#endif
+    return 0;
+}
+
+static int source_root_close(PackageSourceRoot *root)
+{
+    if (!root) return -1;
+#ifdef _WIN32
+    if (root->handle == INVALID_HANDLE_VALUE) return 0;
+    {
+        HANDLE handle = root->handle;
+        root->handle = INVALID_HANDLE_VALUE;
+        return CloseHandle(handle) ? 0 : -1;
+    }
+#else
+    if (root->descriptor < 0) return 0;
+    {
+        const int descriptor = root->descriptor;
+        root->descriptor = -1;
+        return close(descriptor);
+    }
 #endif
 }
+
+static FILE *source_open_manifest_stream(PackageSourceRoot *root,
+                                         const char *manifest_name)
+{
+    if (!root || !manifest_name || !*manifest_name ||
+        strchr(manifest_name, '/') || strchr(manifest_name, '\\') ||
+        strchr(manifest_name, ':'))
+        return NULL;
+#ifdef _WIN32
+    {
+        char candidate[2048];
+        char resolved[2048];
+        HANDLE handle;
+        BY_HANDLE_FILE_INFORMATION info;
+        LARGE_INTEGER size;
+        int descriptor;
+        FILE *stream;
+        if (root->handle == INVALID_HANDLE_VALUE ||
+            source_append_component(candidate, sizeof(candidate), root->path,
+                                    manifest_name) != 0)
+            return NULL;
+        handle = CreateFileA(candidate, GENERIC_READ | FILE_READ_ATTRIBUTES,
+                             FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                             FILE_FLAG_OPEN_REPARSE_POINT |
+                                 FILE_FLAG_SEQUENTIAL_SCAN,
+                             NULL);
+        if (handle == INVALID_HANDLE_VALUE) return NULL;
+        if (!GetFileInformationByHandle(handle, &info) ||
+            (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                      FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
+            GetFileType(handle) != FILE_TYPE_DISK ||
+            !GetFileSizeEx(handle, &size) || size.QuadPart < 0 ||
+            (uint64_t)size.QuadPart > PKG_MANIFEST_MAX_SIZE ||
+            source_handle_path(handle, resolved, sizeof(resolved)) != 0 ||
+            !source_path_is_beneath(root->path, resolved)) {
+            CloseHandle(handle);
+            return NULL;
+        }
+        descriptor = _open_osfhandle((intptr_t)handle,
+                                     _O_RDONLY | _O_BINARY);
+        if (descriptor < 0) {
+            CloseHandle(handle);
+            return NULL;
+        }
+        stream = _fdopen(descriptor, "rb");
+        if (!stream) _close(descriptor);
+        return stream;
+    }
+#else
+    {
+        struct stat info;
+        int flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC;
+        int descriptor;
+        FILE *stream;
+#ifdef O_NONBLOCK
+        flags |= O_NONBLOCK;
+#endif
+        if (root->descriptor < 0) return NULL;
+        descriptor = openat(root->descriptor, manifest_name, flags);
+        if (descriptor < 0) return NULL;
+        if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode) ||
+            info.st_size < 0 ||
+            (uint64_t)info.st_size > PKG_MANIFEST_MAX_SIZE) {
+            (void)close(descriptor);
+            return NULL;
+        }
+        stream = fdopen(descriptor, "rb");
+        if (!stream) (void)close(descriptor);
+        return stream;
+    }
+#endif
+}
+
+static int source_path_valid(const char *path)
+{
+    if (canonical_relative(path, "files.source", 1) != 0) return -1;
+#ifdef _WIN32
+    if (strchr(path, '\\') || strchr(path, ':'))
+        return failf2("source path is not a portable relative path", path);
+#endif
+    return 0;
+}
+
+#ifdef _WIN32
+static int source_read_file(PackageSourceRoot *root, PackageFile *file)
+{
+    char source[PKG_PATH_MAX];
+    char current_path[2048];
+    HANDLE directories[PKG_PATH_MAX / 2u + 1u];
+    size_t directory_count = 0u;
+    char *component;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    BY_HANDLE_FILE_INFORMATION info;
+    LARGE_INTEGER initial_size;
+    LARGE_INTEGER final_size;
+    uint8_t *data = NULL;
+    size_t offset = 0u;
+    int result = -1;
+    if (!root || root->handle == INVALID_HANDLE_VALUE || !file ||
+        strlen(file->source) >= sizeof(source) ||
+        source_path_valid(file->source) != 0)
+        return -1;
+    strcpy(source, file->source);
+    strcpy(current_path, root->path);
+    component = source;
+    for (;;) {
+        char *separator = strchr(component, '/');
+        char candidate[2048];
+        char resolved[2048];
+        HANDLE directory;
+        if (!separator) break;
+        *separator = '\0';
+        if (!*component || directory_count >=
+                               sizeof(directories) / sizeof(directories[0]) ||
+            source_append_component(candidate, sizeof(candidate),
+                                    current_path, component) != 0)
+            goto done;
+        directory = CreateFileA(candidate, FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS |
+                                    FILE_FLAG_OPEN_REPARSE_POINT,
+                                NULL);
+        if (directory == INVALID_HANDLE_VALUE ||
+            !GetFileInformationByHandle(directory, &info) ||
+            (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0u ||
+            (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u ||
+            source_handle_path(directory, resolved, sizeof(resolved)) != 0 ||
+            !source_path_is_beneath(root->path, resolved)) {
+            if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
+            goto done;
+        }
+        directories[directory_count++] = directory;
+        strcpy(current_path, resolved);
+        component = separator + 1u;
+    }
+    if (!*component) goto done;
+    {
+        char candidate[2048];
+        char resolved[2048];
+        if (source_append_component(candidate, sizeof(candidate),
+                                    current_path, component) != 0)
+            goto done;
+        handle = CreateFileA(candidate, GENERIC_READ | FILE_READ_ATTRIBUTES,
+                             FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                             FILE_FLAG_OPEN_REPARSE_POINT |
+                                 FILE_FLAG_SEQUENTIAL_SCAN,
+                             NULL);
+        if (handle == INVALID_HANDLE_VALUE ||
+            !GetFileInformationByHandle(handle, &info) ||
+            (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                      FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
+            !GetFileSizeEx(handle, &initial_size) || initial_size.QuadPart < 0 ||
+            (uint64_t)initial_size.QuadPart > PKG_MAX_FILE_SIZE ||
+            source_handle_path(handle, resolved, sizeof(resolved)) != 0 ||
+            !source_path_is_beneath(root->path, resolved)) {
+            failf2("source is not a regular file within manifest root",
+                   file->source);
+            goto done;
+        }
+    }
+    data = (uint8_t *)malloc(initial_size.QuadPart ?
+                             (size_t)initial_size.QuadPart : 1u);
+    if (!data) {
+        failf("out of memory reading source");
+        goto done;
+    }
+    while (offset < (size_t)initial_size.QuadPart) {
+        DWORD count = 0u;
+        const DWORD request = (DWORD)((size_t)initial_size.QuadPart - offset);
+        if (!ReadFile(handle, data + offset, request, &count, NULL) || count == 0u) {
+            failf2("cannot read source", file->source);
+            goto done;
+        }
+        offset += count;
+    }
+    {
+        uint8_t extra;
+        DWORD count = 0u;
+        if (!ReadFile(handle, &extra, 1u, &count, NULL) || count != 0u ||
+            !GetFileSizeEx(handle, &final_size) ||
+            final_size.QuadPart != initial_size.QuadPart) {
+            failf2("source changed while being read", file->source);
+            goto done;
+        }
+    }
+    result = 0;
+done:
+    if (handle != INVALID_HANDLE_VALUE && !CloseHandle(handle)) {
+        failf2("cannot close source", file->source);
+        result = -1;
+    }
+    while (directory_count != 0u) {
+        if (!CloseHandle(directories[--directory_count])) {
+            failf2("cannot close source directory", file->source);
+            result = -1;
+        }
+    }
+    if (result != 0) {
+        free(data);
+        return -1;
+    }
+    file->data = data;
+    file->size = offset;
+    return 0;
+}
+#else
+static int source_open_relative_file(int root_descriptor, char *path)
+{
+    int current = root_descriptor;
+    int owns_current = 0;
+    char *component = path;
+    for (;;) {
+        char *separator = strchr(component, '/');
+        int next;
+        if (!separator) break;
+        *separator = '\0';
+        if (!*component) goto error;
+        next = openat(current, component,
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (owns_current) (void)close(current);
+        if (next < 0) return -1;
+        current = next;
+        owns_current = 1;
+        component = separator + 1u;
+    }
+    if (!*component) goto error;
+    {
+        const int flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+#ifdef O_NONBLOCK
+                          | O_NONBLOCK
+#endif
+            ;
+        const int descriptor = openat(current, component, flags);
+        if (owns_current) (void)close(current);
+        return descriptor;
+    }
+error:
+    if (owns_current) (void)close(current);
+    return -1;
+}
+
+static int source_read_file(PackageSourceRoot *root, PackageFile *file)
+{
+    char source[PKG_PATH_MAX];
+    struct stat initial;
+    struct stat final;
+    uint8_t *data = NULL;
+    size_t offset = 0u;
+    int descriptor = -1;
+    int result = -1;
+    unsigned interrupted = 0u;
+    if (!root || root->descriptor < 0 || !file ||
+        strlen(file->source) >= sizeof(source) ||
+        source_path_valid(file->source) != 0)
+        return -1;
+    strcpy(source, file->source);
+    descriptor = source_open_relative_file(root->descriptor, source);
+    if (descriptor < 0 || fstat(descriptor, &initial) != 0 ||
+        !S_ISREG(initial.st_mode) || initial.st_size < 0 ||
+        (uint64_t)initial.st_size > PKG_MAX_FILE_SIZE) {
+        failf2("source is not a regular non-symlink file", file->source);
+        goto done;
+    }
+    data = (uint8_t *)malloc(initial.st_size ? (size_t)initial.st_size : 1u);
+    if (!data) {
+        failf("out of memory reading source");
+        goto done;
+    }
+    while (offset < (size_t)initial.st_size) {
+        const ssize_t count = read(descriptor, data + offset,
+                                  (size_t)initial.st_size - offset);
+        if (count < 0 && errno == EINTR) {
+            if (++interrupted < 32u) continue;
+            failf2("source read interrupted repeatedly", file->source);
+            goto done;
+        }
+        if (count <= 0 ||
+            (size_t)count > (size_t)initial.st_size - offset) {
+            failf2("cannot read source", file->source);
+            goto done;
+        }
+        offset += (size_t)count;
+        interrupted = 0u;
+    }
+    for (;;) {
+        uint8_t extra;
+        const ssize_t count = read(descriptor, &extra, sizeof(extra));
+        if (count < 0 && errno == EINTR) {
+            if (++interrupted < 32u) continue;
+            failf2("source read interrupted repeatedly", file->source);
+            goto done;
+        }
+        if (count != 0 || fstat(descriptor, &final) != 0 ||
+            final.st_dev != initial.st_dev || final.st_ino != initial.st_ino ||
+            final.st_size != initial.st_size) {
+            failf2("source changed while being read", file->source);
+            goto done;
+        }
+        break;
+    }
+    result = 0;
+done:
+    if (descriptor >= 0 && close(descriptor) != 0) {
+        failf2("cannot close source", file->source);
+        result = -1;
+    }
+    if (result != 0) {
+        free(data);
+        return -1;
+    }
+    file->data = data;
+    file->size = offset;
+    return 0;
+}
+#endif
 
 static int validate_manifest(Manifest *manifest) {
     size_t index;
@@ -773,38 +1259,26 @@ static int validate_manifest(Manifest *manifest) {
         for (other = 0; other < index; ++other) if (strcmp(manifest->capabilities[index], manifest->capabilities[other]) == 0) return failf("duplicate capability");
     }
     for (index = 0; index < manifest->file_count; ++index) {
-        char source_path[2048];
-        char resolved[2048];
-        RinStat st;
-        if (canonical_relative(manifest->files[index].path, "files.path", 0) != 0 ||
-            strlen(manifest->files[index].path) >= PKG_NAME_MAX ||
-            copy_text(manifest->files[index].source, sizeof(manifest->files[index].source), manifest->files[index].source, "files.source", 0) != 0) return -1;
-        for (other = 0; other < index; ++other) if (strcmp(manifest->files[index].path, manifest->files[other].path) == 0) return failf("duplicate package destination path");
-        if (snprintf(source_path, sizeof(source_path), "%s/%s", manifest->root, manifest->files[index].source) >= (int)sizeof(source_path) || !resolve_full_path(resolved, source_path, sizeof(resolved))) return failf("source path is too long");
-        {
-            size_t root_length = strlen(manifest->root);
-            if (strlen(resolved) <= root_length || strncasecmp(resolved, manifest->root, root_length) != 0 || (resolved[root_length] != '/' && resolved[root_length] != '\\')) return failf("file source escapes manifest directory");
-        }
-        if (source_is_link(resolved) || rin_stat(resolved, &st) != 0 || !rin_stat_is_regular(st)) return failf2("source is not a regular non-symlink file", resolved);
-        if ((uint64_t)st.st_size > PKG_MAX_FILE_SIZE) return failf2("source exceeds per-file limit", resolved);
-        manifest->files[index].data = (uint8_t *)malloc(st.st_size ? (size_t)st.st_size : 1u);
-        manifest->files[index].size = (size_t)st.st_size;
-        if (!manifest->files[index].data) return failf("out of memory reading source");
-        {
-            FILE *source = fopen(resolved, "rb");
-            if (!source || (st.st_size && fread(manifest->files[index].data, 1, (size_t)st.st_size, source) != (size_t)st.st_size)) {
-                if (source) fclose(source);
-                return failf2("cannot read source", resolved);
+        PackageFile *file = &manifest->files[index];
+        if (canonical_relative(file->path, "files.path", 0) != 0 ||
+            strlen(file->path) >= PKG_NAME_MAX ||
+            source_path_valid(file->source) != 0)
+            return -1;
+        for (other = 0; other < index; ++other) {
+            if (strcmp(file->path, manifest->files[other].path) == 0) {
+                return failf("duplicate package destination path");
             }
-            fclose(source);
         }
+        if (source_read_file(&manifest->source_root, file) != 0) return -1;
     }
     return 0;
 }
 
 static void manifest_free(Manifest *manifest) {
     size_t index;
+    if (!manifest) return;
     for (index = 0; index < manifest->file_count; ++index) free(manifest->files[index].data);
+    (void)source_root_close(&manifest->source_root);
 }
 
 static int compare_file(const void *left, const void *right) {
@@ -959,7 +1433,9 @@ static int make_file_identity_metadata(const Manifest *manifest, Buffer *out) {
         memset(record, 0, sizeof(record));
         memcpy(record, manifest->files[index].path, strlen(manifest->files[index].path));
         put64(record, 192, manifest->files[index].size);
-        EVP_Digest(manifest->files[index].data, manifest->files[index].size, digest, NULL, EVP_sha256(), NULL);
+        if (checked_sha256(manifest->files[index].data,
+                           manifest->files[index].size, digest) != 0)
+            goto error;
         memcpy(record + 200, digest, sizeof(digest));
         if (manifest->files[index].size >= RIN_IMAGE_HEADER_SIZE && get32(manifest->files[index].data, 0) == RIN_IMAGE_MAGIC && get32(manifest->files[index].data, 4) == RIN_IMAGE_VERSION_V3 && get16(manifest->files[index].data, 8) == RIN_IMAGE_HEADER_SIZE && (get32(manifest->files[index].data, 16) & RIN_IMAGE_EXECUTABLE) != 0u)
             memcpy(record + 232, manifest->files[index].data + 116, 32);
@@ -1276,7 +1752,8 @@ static int sign_package(Buffer *image, const char *private_path, const char *pub
     if (load_public_der(public_path, &public_der, &trusted_rsa) != 0 || load_private_key(private_path, &private_key) != 0) goto error;
     RSA_free(trusted_rsa); trusted_rsa = NULL;
     if (public_der_matches(private_key, &public_der) != 0 || digest_sign(private_key, image->data, image->size, &probe, &probe_size) != 0 || probe_size < 256u || probe_size > 512u) goto error;
-    EVP_Digest(public_der.data, public_der.size, key_id, NULL, EVP_sha256(), NULL);
+    if (checked_sha256(public_der.data, public_der.size, key_id) != 0)
+        goto error;
     put16(image->data, 4, PKG_VERSION_PRODUCTION_SIGNED);
     put32(image->data, 176, PKG_FLAG_SIGNED);
     put64(image->data, 184, image->size);
@@ -1313,7 +1790,7 @@ static int verify_signature(const Buffer *package, const char *public_path) {
     int result = -1;
     if (load_public_der(public_path, &der, &rsa) != 0) goto done;
     if (total < 48u || get32(envelope, 0) != RIN_SIGNATURE_MAGIC || get16(envelope, 4) != 1u || get16(envelope, 6) != 48u || get16(envelope, 8) != 1u || get16(envelope, 10) + 48u != get32(package->data, 192)) goto done;
-    EVP_Digest(der.data, der.size, key_id, NULL, EVP_sha256(), NULL);
+    if (checked_sha256(der.data, der.size, key_id) != 0) goto done;
     if (memcmp(envelope + 12, key_id, 32) != 0) goto done;
     key = EVP_PKEY_new();
     if (!key || EVP_PKEY_assign_RSA(key, rsa) != 1) goto done;
@@ -1398,15 +1875,30 @@ static void print_hex(const uint8_t *value, size_t size) {
     for (index = 0; index < size; ++index) printf("%02x", value[index]);
 }
 
-static void print_inspection(const Buffer *package, int json);
+static int print_inspection(const Buffer *package, int json);
 
-static void print_inspection(const Buffer *package, int json) {
+static int print_inspection(const Buffer *package, int json) {
     size_t data_offset, count, index;
     const uint8_t *header = package->data;
     uint8_t package_digest[32];
-    if (validate_package(package, &data_offset, &count) != 0) return;
-    if (!json) { printf("package %s %s (%llu files, %u bytes)\n", (const char *)(header + 8), (const char *)(header + 72), (unsigned long long)count, get32(header, 172)); return; }
-    EVP_Digest(package->data, package->size, package_digest, NULL, EVP_sha256(), NULL);
+    uint8_t entry_digests[PKG_MAX_FILES][32];
+    if (validate_package(package, &data_offset, &count) != 0) return -1;
+    if (!json) {
+        printf("package %s %s (%llu files, %u bytes)\n",
+               (const char *)(header + 8), (const char *)(header + 72),
+               (unsigned long long)count, get32(header, 172));
+        return 0;
+    }
+    if (checked_sha256(package->data, package->size, package_digest) != 0)
+        return -1;
+    for (index = 0; index < count; ++index) {
+        const uint8_t *entry = package->data + PKG_HEADER_SIZE +
+                               index * PKG_ENTRY_SIZE;
+        if (checked_sha256(
+                package->data + data_offset + get32(entry, 192),
+                get32(entry, 196), entry_digests[index]) != 0)
+            return -1;
+    }
     printf("{\"format\":\".rpk\",\"version\":%u,\"package_type\":%u,\"package_id\":", get16(header, 4), get16(header, 6)); json_string((const char *)(header + 8));
     printf(",\"package_version\":"); json_string((const char *)(header + 72));
     printf(",\"display_name\":"); json_string((const char *)(header + 104));
@@ -1418,13 +1910,12 @@ static void print_inspection(const Buffer *package, int json) {
     for (index = 0; index < count; ++index) {
         const uint8_t *entry = package->data + PKG_HEADER_SIZE + index * PKG_ENTRY_SIZE;
         if (index) putchar(',');
-        uint8_t entry_digest[32];
-        EVP_Digest(package->data + data_offset + get32(entry, 192), get32(entry, 196), entry_digest, NULL, EVP_sha256(), NULL);
         printf("{\"path\":"); json_string((const char *)entry); printf(",\"offset\":%u,\"size\":%u,\"sha256\":\"", get32(entry, 192), get32(entry, 196));
-        print_hex(entry_digest, sizeof(entry_digest));
+        print_hex(entry_digests[index], sizeof(entry_digests[index]));
         printf("\",\"metadata\":%s}", get16(entry, 204) ? "true" : "false");
     }
     puts("]}");
+    return ferror(stdout) ? failf("cannot write package inspection") : 0;
 }
 
 static int build_command(const Options *options) {
@@ -1448,14 +1939,19 @@ static int build_command(const Options *options) {
     if (validate_dependency_ranges(manifest.dependencies, manifest.dependency_count, manifest.package_id) != 0 || validate_dependency_ranges(manifest.optional_dependencies, manifest.optional_dependency_count, manifest.package_id) != 0) goto done;
     if (manifest.entry_point_count) for (size_t index = 0; index < manifest.entry_point_count; ++index) if (canonical_relative(manifest.entry_points[index].path, "entry point path", 0) != 0) goto done;
     if (signed_package && read_file(options->public_key, &public_der) != 0) goto done;
-    if (signed_package) EVP_Digest(public_der.data, public_der.size, key_id, NULL, EVP_sha256(), NULL);
+    if (signed_package &&
+        checked_sha256(public_der.data, public_der.size, key_id) != 0)
+        goto done;
     if (build_image(&manifest, key_id, options->generation_set ? options->publisher_generation : 0u, signed_package, &image) != 0) goto done;
     if (signed_package && sign_package(&image, options->sign_key, options->public_key, options->generation_set ? options->publisher_generation : 0u) != 0) goto done;
     if (write_atomic(options->output, &image) != 0) goto done;
     if (options->json) {
         Buffer written = {0};
         if (read_file(options->output, &written) != 0) goto done;
-        print_inspection(&written, 1);
+        if (print_inspection(&written, 1) != 0) {
+            buffer_free(&written);
+            goto done;
+        }
         buffer_free(&written);
     } else {
         printf("created %s (%s %s%s)\n", options->output, manifest.package_id, manifest.version, signed_package ? ", signed" : ", unsigned");
@@ -1473,7 +1969,7 @@ static int inspect_command(const Options *options) {
     int result;
     if (!options->package || read_file(options->package, &package) != 0) return -1;
     result = validate_package(&package, &(size_t){0}, &(size_t){0});
-    if (result == 0) print_inspection(&package, options->json);
+    if (result == 0) result = print_inspection(&package, options->json);
     buffer_free(&package);
     return result;
 }
