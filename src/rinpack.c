@@ -174,6 +174,7 @@ typedef struct {
 typedef struct {
     int json;
     const char *manifest;
+    const char *application_metadata;
     const char *output;
     const char *package;
     const char *sign_key;
@@ -1352,6 +1353,8 @@ static int metadata_init(Metadata *metadata, const char *path, const void *data,
     return 0;
 }
 
+static int read_file(const char *path, Buffer *out);
+
 static void metadata_free(Metadata *metadata, size_t count) {
     size_t index;
     for (index = 0; index < count; ++index) buffer_free(&metadata[index].data);
@@ -1532,11 +1535,12 @@ static int make_package_manifest(const Manifest *manifest, const uint8_t key_id[
 }
 
 static int build_image(const Manifest *manifest, const uint8_t key_id[32], unsigned generation,
-                       int signed_package, Buffer *image) {
+                       int signed_package, const char *application_metadata_path,
+                       Buffer *image) {
     uint8_t base_header[PKG_HEADER_SIZE];
     uint8_t base_entries[PKG_MAX_FILES * PKG_ENTRY_SIZE];
     Buffer payload = {0};
-    Metadata metadata[4];
+    Metadata metadata[5];
     size_t metadata_count = 0;
     size_t index;
     size_t metadata_payload_size = 0;
@@ -1548,6 +1552,24 @@ static int build_image(const Manifest *manifest, const uint8_t key_id[32], unsig
     base_total = (uint32_t)payload.size;
     if (signed_package) {
         Buffer value = {0};
+        if (application_metadata_path) {
+            if (read_file(application_metadata_path, &value) != 0) {
+                buffer_free(&value);
+                goto error;
+            }
+            if (value.size == 0u || value.size > 16384u) {
+                failf("application metadata is outside its size limit");
+                buffer_free(&value);
+                goto error;
+            }
+            if (metadata_init(&metadata[metadata_count++],
+                              ".rinpkg/application.json", value.data,
+                              value.size) != 0) {
+                buffer_free(&value);
+                goto error;
+            }
+            buffer_free(&value);
+        }
         if (manifest->dependency_count) {
             if (make_dependency_metadata(manifest, &value) != 0 || metadata_init(&metadata[metadata_count++], ".rinpkg/dependencies.rdep", value.data, value.size) != 0) { buffer_free(&value); goto error; }
             buffer_free(&value);
@@ -1942,7 +1964,14 @@ static int build_command(const Options *options) {
     if (signed_package &&
         checked_sha256(public_der.data, public_der.size, key_id) != 0)
         goto done;
-    if (build_image(&manifest, key_id, options->generation_set ? options->publisher_generation : 0u, signed_package, &image) != 0) goto done;
+    if (options->application_metadata && !signed_package) {
+        failf("application metadata requires a signed package");
+        goto done;
+    }
+    if (build_image(&manifest, key_id,
+                    options->generation_set ? options->publisher_generation : 0u,
+                    signed_package, options->application_metadata, &image) != 0)
+        goto done;
     if (signed_package && sign_package(&image, options->sign_key, options->public_key, options->generation_set ? options->publisher_generation : 0u) != 0) goto done;
     if (write_atomic(options->output, &image) != 0) goto done;
     if (options->json) {
@@ -1988,7 +2017,7 @@ static int verify_command(const Options *options) {
 }
 
 static void usage(void) {
-    puts("usage: rinpack create --manifest package.toml --output app.rpk [--sign-key private.pem --public-key public.der --publisher-generation N]");
+    puts("usage: rinpack create --manifest package.toml --output app.rpk [--application-metadata app.json] [--sign-key private.pem --public-key public.der --publisher-generation N]");
     puts("       rinpack inspect --package app.rpk [--json]");
     puts("       rinpack verify --package app.rpk --public-key public.der [--json]");
 }
@@ -2003,6 +2032,7 @@ int main(int argc, char **argv) {
     for (index = 2; index < argc; ++index) {
         if (strcmp(argv[index], "--json") == 0) options.json = 1;
         else if (strcmp(argv[index], "--manifest") == 0 && index + 1 < argc) options.manifest = argv[++index];
+        else if (strcmp(argv[index], "--application-metadata") == 0 && index + 1 < argc) options.application_metadata = argv[++index];
         else if (strcmp(argv[index], "--output") == 0 && index + 1 < argc) options.output = argv[++index];
         else if (strcmp(argv[index], "--package") == 0 && index + 1 < argc) options.package = argv[++index];
         else if (strcmp(argv[index], "--sign-key") == 0 && index + 1 < argc) options.sign_key = argv[++index];
