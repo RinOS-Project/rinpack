@@ -1000,6 +1000,7 @@ static FILE *source_open_manifest_stream(PackageSourceRoot *root,
         if (!GetFileInformationByHandle(handle, &info) ||
             (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
                                       FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
+            info.nNumberOfLinks != 1u ||
             GetFileType(handle) != FILE_TYPE_DISK ||
             !GetFileSizeEx(handle, &size) || size.QuadPart < 0 ||
             (uint64_t)size.QuadPart > PKG_MANIFEST_MAX_SIZE ||
@@ -1031,6 +1032,7 @@ static FILE *source_open_manifest_stream(PackageSourceRoot *root,
         descriptor = openat(root->descriptor, manifest_name, flags);
         if (descriptor < 0) return NULL;
         if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode) ||
+            info.st_nlink != 1 ||
             info.st_size < 0 ||
             (uint64_t)info.st_size > PKG_MANIFEST_MAX_SIZE) {
             (void)close(descriptor);
@@ -1122,6 +1124,7 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
             !GetFileInformationByHandle(handle, &info) ||
             (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
                                       FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
+            info.nNumberOfLinks != 1u ||
             !GetFileSizeEx(handle, &initial_size) || initial_size.QuadPart < 0 ||
             (uint64_t)initial_size.QuadPart > PKG_MAX_FILE_SIZE ||
             source_handle_path(handle, resolved, sizeof(resolved)) != 0 ||
@@ -1151,6 +1154,8 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
         uint8_t extra;
         DWORD count = 0u;
         if (!ReadFile(handle, &extra, 1u, &count, NULL) || count != 0u ||
+            !GetFileInformationByHandle(handle, &info) ||
+            info.nNumberOfLinks != 1u ||
             !GetFileSizeEx(handle, &final_size) ||
             final_size.QuadPart != initial_size.QuadPart ||
             !source_root_path_matches(root)) {
@@ -1239,7 +1244,8 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
         goto done;
     }
     if (fstat(descriptor, &initial) != 0 ||
-        !S_ISREG(initial.st_mode) || initial.st_size < 0 ||
+        !S_ISREG(initial.st_mode) || initial.st_nlink != 1 ||
+        initial.st_size < 0 ||
         (uint64_t)initial.st_size > PKG_MAX_FILE_SIZE) {
         failf2("source is not a regular non-symlink file", file->source);
         goto done;
@@ -1275,6 +1281,7 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
         }
         if (count != 0 || fstat(descriptor, &final) != 0 ||
             final.st_dev != initial.st_dev || final.st_ino != initial.st_ino ||
+            final.st_nlink != 1 ||
             final.st_size != initial.st_size ||
             !source_root_path_matches(root)) {
             failf2("source changed while being read", file->source);
