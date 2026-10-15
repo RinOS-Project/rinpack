@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -12,6 +13,15 @@
 #include <unistd.h>
 
 typedef int (*openat_fn)(int, const char *, int, ...);
+typedef ssize_t (*read_fn)(int, void *, size_t);
+typedef char *(*fgets_fn)(char *, int, FILE *);
+
+static int watched_descriptor = -1;
+static int watched_directory = -1;
+static int hardlink_attempted;
+static char watched_component[256];
+static char watched_alias[4096];
+static char watched_marker[4096];
 
 static const char replacement_manifest[] =
     "[package]\n"
@@ -53,6 +63,49 @@ static int write_file(const char *path, const char *contents)
     return close(descriptor);
 }
 
+static void create_hardlink_after_read(int descriptor)
+{
+    char error_message[64];
+    int error_number;
+    if (descriptor != watched_descriptor || hardlink_attempted ||
+        watched_directory < 0)
+        return;
+    hardlink_attempted = 1;
+    if (linkat(watched_directory, watched_component, AT_FDCWD,
+               watched_alias, 0) == 0) {
+        (void)write_file(watched_marker, "created\n");
+    } else {
+        error_number = errno;
+        (void)snprintf(error_message, sizeof(error_message), "error=%d\n",
+                       error_number);
+        (void)write_file(watched_marker, error_message);
+    }
+    (void)close(watched_directory);
+    watched_directory = -1;
+}
+
+ssize_t read(int descriptor, void *buffer, size_t size)
+{
+    static read_fn real_read;
+    ssize_t result;
+    if (!real_read) real_read = (read_fn)dlsym(RTLD_NEXT, "read");
+    if (!real_read) return -1;
+    result = real_read(descriptor, buffer, size);
+    if (result > 0) create_hardlink_after_read(descriptor);
+    return result;
+}
+
+char *fgets(char *buffer, int size, FILE *stream)
+{
+    static fgets_fn real_fgets;
+    char *result;
+    if (!real_fgets) real_fgets = (fgets_fn)dlsym(RTLD_NEXT, "fgets");
+    if (!real_fgets) return NULL;
+    result = real_fgets(buffer, size, stream);
+    if (result) create_hardlink_after_read(fileno(stream));
+    return result;
+}
+
 int openat(int directory, const char *path, int flags, ...)
 {
     static openat_fn real_openat;
@@ -71,6 +124,87 @@ int openat(int directory, const char *path, int flags, ...)
     if (!real_openat)
         real_openat = (openat_fn)dlsym(RTLD_NEXT, "openat");
     if (!real_openat) return -1;
+    {
+        const char *swap_style = getenv("RINPACK_TEST_SWAP_STYLE");
+        const char *swap_component = getenv("RINPACK_TEST_SWAP_COMPONENT");
+        const char *swap_target = getenv("RINPACK_TEST_SWAP_TARGET");
+        const char *marker = getenv("RINPACK_TEST_SWAP_MARKER");
+        if (swap_style && strcmp(swap_style, "component-symlink") == 0 &&
+            swap_component && swap_target && marker &&
+            strcmp(path, swap_component) == 0) {
+            char held[4096];
+            int length = snprintf(held, sizeof(held), "%s.rinpack-held", path);
+            if (length < 0 || (size_t)length >= sizeof(held)) return -1;
+            if (renameat(directory, path, directory, held) != 0) {
+                char message[64];
+                (void)snprintf(message, sizeof(message), "error=%d\n", errno);
+                (void)write_file(marker, message);
+                return -1;
+            }
+            if (symlinkat(swap_target, directory, path) != 0) {
+                const int failure = errno;
+                (void)renameat(directory, held, directory, path);
+                {
+                    char message[64];
+                    (void)snprintf(message, sizeof(message), "error=%d\n",
+                                   failure);
+                    (void)write_file(marker, message);
+                }
+                errno = failure;
+                return -1;
+            }
+            (void)write_file(marker, "created\n");
+            {
+                int descriptor = has_mode
+                    ? real_openat(directory, path, flags, mode)
+                    : real_openat(directory, path, flags);
+                const int open_error = errno;
+                if (unlinkat(directory, path, 0) != 0 ||
+                    renameat(directory, held, directory, path) != 0) {
+                    if (descriptor >= 0) (void)close(descriptor);
+                    return -1;
+                }
+                errno = open_error;
+                return descriptor;
+            }
+        }
+    }
+    {
+        const char *hardlink_component =
+            getenv("RINPACK_TEST_HARDLINK_COMPONENT");
+        const char *hardlink_alias = getenv("RINPACK_TEST_HARDLINK_ALIAS");
+        const char *hardlink_marker = getenv("RINPACK_TEST_HARDLINK_MARKER");
+        if (hardlink_component && hardlink_alias && hardlink_marker &&
+            watched_descriptor < 0 &&
+            strcmp(path, hardlink_component) == 0) {
+            int descriptor = has_mode
+                ? real_openat(directory, path, flags, mode)
+                : real_openat(directory, path, flags);
+            if (descriptor >= 0) {
+                int component_length = snprintf(
+                    watched_component, sizeof(watched_component), "%s", path);
+                int alias_length = snprintf(
+                    watched_alias, sizeof(watched_alias), "%s", hardlink_alias);
+                int marker_length = snprintf(
+                    watched_marker, sizeof(watched_marker), "%s", hardlink_marker);
+                watched_directory = dup(directory);
+                if (component_length < 0 ||
+                    (size_t)component_length >= sizeof(watched_component) ||
+                    alias_length < 0 ||
+                    (size_t)alias_length >= sizeof(watched_alias) ||
+                    marker_length < 0 ||
+                    (size_t)marker_length >= sizeof(watched_marker) ||
+                    watched_directory < 0) {
+                    if (watched_directory >= 0) close(watched_directory);
+                    watched_directory = -1;
+                    close(descriptor);
+                    return -1;
+                }
+                watched_descriptor = descriptor;
+            }
+            return descriptor;
+        }
+    }
     {
         const char *swap_component = getenv("RINPACK_TEST_SWAP_COMPONENT");
         if (!swap_component) swap_component = "payload.bin";
