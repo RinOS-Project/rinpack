@@ -2,6 +2,7 @@
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -O2
 LDLIBS ?= -lcrypto -lz
+TEST_BUILD_DIR ?= ../../../build/rinpack-source-toctou
 
 # GNU make supplies a built-in `CC=cc`.  On Windows that command is often not
 # installed even when the selected GCC toolchain is available, so use gcc for
@@ -36,4 +37,18 @@ clean:
 	$(call RM_F,rinpack)
 	$(call RM_F,rinpack.exe)
 
-.PHONY: all clean
+ifeq ($(OS),Windows_NT)
+check-source-toctou: src/rinpack.c | $(TEST_BUILD_DIR)
+	$(CC) $(CFLAGS) -o $(TEST_BUILD_DIR)/rinpack-source-toctou.exe $< $(LDLIBS)
+	python tests/source_toctou_test.py --binary $(TEST_BUILD_DIR)/rinpack-source-toctou.exe
+else
+check-source-toctou: src/rinpack.c tests/source_root_swap_interposer.c | $(TEST_BUILD_DIR)
+	$(CC) $(CFLAGS) -o $(TEST_BUILD_DIR)/rinpack-source-toctou $< $(LDLIBS)
+	$(CC) -std=c11 -Wall -Wextra -O2 -fPIC -shared tests/source_root_swap_interposer.c -o $(TEST_BUILD_DIR)/source_root_swap.so -ldl
+	python3 tests/source_toctou_test.py --binary $(TEST_BUILD_DIR)/rinpack-source-toctou --interposer $(TEST_BUILD_DIR)/source_root_swap.so
+endif
+
+$(TEST_BUILD_DIR):
+	$(call MKDIR_P,$@)
+
+.PHONY: all clean check-source-toctou

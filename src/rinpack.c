@@ -132,6 +132,7 @@ typedef struct {
     char path[2048];
 #else
     int descriptor;
+    char path[1024];
 #endif
 } PackageSourceRoot;
 
@@ -167,6 +168,7 @@ typedef struct {
 } Manifest;
 
 static int source_root_open(PackageSourceRoot *root, const char *path);
+static int source_root_path_matches(PackageSourceRoot *root);
 static FILE *source_open_manifest_stream(PackageSourceRoot *root,
                                          const char *manifest_name);
 static int source_root_close(PackageSourceRoot *root);
@@ -673,6 +675,10 @@ static int parse_manifest(const char *path, Manifest *manifest) {
         return -1;
     stream = source_open_manifest_stream(&manifest->source_root, manifest_name);
     if (!stream) return failf2("cannot open manifest", path);
+    if (!source_root_path_matches(&manifest->source_root)) {
+        (void)fclose(stream);
+        return failf2("manifest source root changed while opening manifest", path);
+    }
     while (fgets(line, sizeof(line), stream)) {
         char *content;
         char *key;
@@ -706,8 +712,11 @@ static int parse_manifest(const char *path, Manifest *manifest) {
             fclose(stream); return failf("manifest assignment is outside a table");
         }
     }
-    if (ferror(stream)) { fclose(stream); return failf2("cannot read manifest", path); }
-    fclose(stream);
+    if (ferror(stream)) { (void)fclose(stream); return failf2("cannot read manifest", path); }
+    if (fclose(stream) != 0)
+        return failf2("cannot close manifest", path);
+    if (!source_root_path_matches(&manifest->source_root))
+        return failf2("manifest source root changed while reading manifest", path);
     if (package_seen != ((1u << 17u) - 1u) || manifest->file_count == 0u) return failf("manifest is missing required fields or files");
     for (index = 0; index < manifest->file_count; ++index) {
         if (strchr(manifest->files[index].path, '\\') || manifest->files[index].path[0] == '/' ||
@@ -883,6 +892,8 @@ static int source_root_open(PackageSourceRoot *root, const char *path)
     }
 #else
     struct stat info;
+    if (strlen(path) >= sizeof(root->path))
+        return failf2("source root path is too long", path);
     root->descriptor = source_open_directory_path(path);
     if (root->descriptor < 0 || fstat(root->descriptor, &info) != 0 ||
         !S_ISDIR(info.st_mode)) {
@@ -890,8 +901,54 @@ static int source_root_open(PackageSourceRoot *root, const char *path)
         root->descriptor = -1;
         return failf2("cannot open manifest source root", path);
     }
+    memcpy(root->path, path, strlen(path) + 1u);
 #endif
     return 0;
+}
+
+/* Some host filesystems do not preserve ordinary POSIX directory-descriptor
+ * semantics when a mounted directory is renamed. Refuse to publish a package
+ * if the pathname no longer identifies the root object opened for the
+ * manifest. The descriptor remains the source of truth; this check only
+ * detects providers that redirect openat() through the replacement path. */
+static int source_root_path_matches(PackageSourceRoot *root)
+{
+    if (!root) return 0;
+#ifdef _WIN32
+    {
+        BY_HANDLE_FILE_INFORMATION held;
+        BY_HANDLE_FILE_INFORMATION current;
+        HANDLE handle;
+        int matches;
+        if (root->handle == INVALID_HANDLE_VALUE ||
+            !GetFileInformationByHandle(root->handle, &held))
+            return 0;
+        handle = CreateFileA(root->path, FILE_READ_ATTRIBUTES,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS |
+                                 FILE_FLAG_OPEN_REPARSE_POINT,
+                             NULL);
+        if (handle == INVALID_HANDLE_VALUE) return 0;
+        matches = GetFileInformationByHandle(handle, &current) &&
+                  (current.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0u &&
+                  (current.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0u &&
+                  current.dwVolumeSerialNumber == held.dwVolumeSerialNumber &&
+                  current.nFileIndexHigh == held.nFileIndexHigh &&
+                  current.nFileIndexLow == held.nFileIndexLow;
+        if (!CloseHandle(handle)) matches = 0;
+        return matches;
+    }
+#else
+    {
+        struct stat held;
+        struct stat current;
+        return root->descriptor >= 0 && root->path[0] != '\0' &&
+               fstat(root->descriptor, &held) == 0 &&
+               stat(root->path, &current) == 0 && S_ISDIR(current.st_mode) &&
+               held.st_dev == current.st_dev && held.st_ino == current.st_ino;
+    }
+#endif
 }
 
 static int source_root_close(PackageSourceRoot *root)
@@ -1068,7 +1125,8 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
             !GetFileSizeEx(handle, &initial_size) || initial_size.QuadPart < 0 ||
             (uint64_t)initial_size.QuadPart > PKG_MAX_FILE_SIZE ||
             source_handle_path(handle, resolved, sizeof(resolved)) != 0 ||
-            !source_path_is_beneath(root->path, resolved)) {
+            !source_path_is_beneath(root->path, resolved) ||
+            !source_root_path_matches(root)) {
             failf2("source is not a regular file within manifest root",
                    file->source);
             goto done;
@@ -1094,7 +1152,8 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
         DWORD count = 0u;
         if (!ReadFile(handle, &extra, 1u, &count, NULL) || count != 0u ||
             !GetFileSizeEx(handle, &final_size) ||
-            final_size.QuadPart != initial_size.QuadPart) {
+            final_size.QuadPart != initial_size.QuadPart ||
+            !source_root_path_matches(root)) {
             failf2("source changed while being read", file->source);
             goto done;
         }
@@ -1171,7 +1230,15 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
         return -1;
     strcpy(source, file->source);
     descriptor = source_open_relative_file(root->descriptor, source);
-    if (descriptor < 0 || fstat(descriptor, &initial) != 0 ||
+    if (descriptor < 0) {
+        failf2("cannot open source", file->source);
+        goto done;
+    }
+    if (!source_root_path_matches(root)) {
+        failf2("manifest source root changed while opening", file->source);
+        goto done;
+    }
+    if (fstat(descriptor, &initial) != 0 ||
         !S_ISREG(initial.st_mode) || initial.st_size < 0 ||
         (uint64_t)initial.st_size > PKG_MAX_FILE_SIZE) {
         failf2("source is not a regular non-symlink file", file->source);
@@ -1208,7 +1275,8 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
         }
         if (count != 0 || fstat(descriptor, &final) != 0 ||
             final.st_dev != initial.st_dev || final.st_ino != initial.st_ino ||
-            final.st_size != initial.st_size) {
+            final.st_size != initial.st_size ||
+            !source_root_path_matches(root)) {
             failf2("source changed while being read", file->source);
             goto done;
         }
