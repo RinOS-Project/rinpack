@@ -169,6 +169,9 @@ typedef struct {
 
 static int source_root_open(PackageSourceRoot *root, const char *path);
 static int source_root_path_matches(PackageSourceRoot *root);
+static int source_manifest_stream_matches(PackageSourceRoot *root,
+                                          FILE *stream,
+                                          const char *manifest_name);
 static FILE *source_open_manifest_stream(PackageSourceRoot *root,
                                          const char *manifest_name);
 static int source_root_close(PackageSourceRoot *root);
@@ -713,6 +716,12 @@ static int parse_manifest(const char *path, Manifest *manifest) {
         }
     }
     if (ferror(stream)) { (void)fclose(stream); return failf2("cannot read manifest", path); }
+    if (!source_manifest_stream_matches(&manifest->source_root, stream,
+                                        manifest_name)) {
+        (void)fclose(stream);
+        return failf2("manifest changed or gained a hard link while reading",
+                      path);
+    }
     if (fclose(stream) != 0)
         return failf2("cannot close manifest", path);
     if (!source_root_path_matches(&manifest->source_root))
@@ -947,6 +956,82 @@ static int source_root_path_matches(PackageSourceRoot *root)
                fstat(root->descriptor, &held) == 0 &&
                stat(root->path, &current) == 0 && S_ISDIR(current.st_mode) &&
                held.st_dev == current.st_dev && held.st_ino == current.st_ino;
+    }
+#endif
+}
+
+/* The manifest is parsed through a held file descriptor, but a POSIX caller
+ * can still add a hard link while that descriptor is open.  Recheck both the
+ * opened object and its name beneath the held root immediately before the
+ * parsed manifest is accepted.  Windows sharing rules prevent replacement
+ * while the stream is open; the same identity check is retained there. */
+static int source_manifest_stream_matches(PackageSourceRoot *root,
+                                          FILE *stream,
+                                          const char *manifest_name)
+{
+    if (!root || !stream || !manifest_name || !*manifest_name ||
+        strchr(manifest_name, '/') || strchr(manifest_name, '\\') ||
+        strchr(manifest_name, ':'))
+        return 0;
+#ifdef _WIN32
+    {
+        char candidate[2048];
+        char resolved[2048];
+        char named_path[2048];
+        BY_HANDLE_FILE_INFORMATION opened;
+        BY_HANDLE_FILE_INFORMATION named;
+        LARGE_INTEGER size;
+        HANDLE named_handle;
+        intptr_t raw_handle = _get_osfhandle(_fileno(stream));
+        HANDLE opened_handle;
+        int matches;
+        if (raw_handle == -1 || root->handle == INVALID_HANDLE_VALUE)
+            return 0;
+        opened_handle = (HANDLE)raw_handle;
+        if (!GetFileInformationByHandle(opened_handle, &opened) ||
+            (opened.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                        FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
+            opened.nNumberOfLinks != 1u ||
+            GetFileType(opened_handle) != FILE_TYPE_DISK ||
+            !GetFileSizeEx(opened_handle, &size) || size.QuadPart < 0 ||
+            (uint64_t)size.QuadPart > PKG_MANIFEST_MAX_SIZE ||
+            source_handle_path(opened_handle, resolved, sizeof(resolved)) != 0 ||
+            !source_path_is_beneath(root->path, resolved) ||
+            source_append_component(candidate, sizeof(candidate), root->path,
+                                    manifest_name) != 0 ||
+            !source_root_path_matches(root))
+            return 0;
+        named_handle = CreateFileA(candidate, FILE_READ_ATTRIBUTES,
+                                   FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                   FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (named_handle == INVALID_HANDLE_VALUE) return 0;
+        matches = GetFileInformationByHandle(named_handle, &named) &&
+                  (named.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                             FILE_ATTRIBUTE_REPARSE_POINT)) == 0u &&
+                  named.nNumberOfLinks == 1u &&
+                  named.dwVolumeSerialNumber == opened.dwVolumeSerialNumber &&
+                  named.nFileIndexHigh == opened.nFileIndexHigh &&
+                  named.nFileIndexLow == opened.nFileIndexLow &&
+                  source_handle_path(named_handle, named_path,
+                                     sizeof(named_path)) == 0 &&
+                  source_path_is_beneath(root->path, named_path);
+        if (!CloseHandle(named_handle)) matches = 0;
+        return matches;
+    }
+#else
+    {
+        struct stat opened;
+        struct stat named;
+        int descriptor = fileno(stream);
+        return descriptor >= 0 && root->descriptor >= 0 &&
+               fstat(descriptor, &opened) == 0 && S_ISREG(opened.st_mode) &&
+               opened.st_nlink == 1 && opened.st_size >= 0 &&
+               (uint64_t)opened.st_size <= PKG_MANIFEST_MAX_SIZE &&
+               fstatat(root->descriptor, manifest_name, &named,
+                       AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(named.st_mode) &&
+               named.st_nlink == 1 && named.st_dev == opened.st_dev &&
+               named.st_ino == opened.st_ino &&
+               source_root_path_matches(root);
     }
 #endif
 }
