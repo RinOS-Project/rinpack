@@ -13,15 +13,24 @@
 #include <unistd.h>
 
 typedef int (*openat_fn)(int, const char *, int, ...);
-typedef ssize_t (*read_fn)(int, void *, size_t);
-typedef char *(*fgets_fn)(char *, int, FILE *);
+typedef int (*fstat_fn)(int, struct stat *);
 
 static int watched_descriptor = -1;
 static int watched_directory = -1;
+static unsigned watched_fstat_count;
 static int hardlink_attempted;
 static char watched_component[256];
 static char watched_alias[4096];
 static char watched_marker[4096];
+
+static int is_expected_root(int descriptor)
+{
+    const char *path = getenv("RINPACK_TEST_HARDLINK_ROOT");
+    struct stat actual;
+    struct stat expected;
+    return path && fstat(descriptor, &actual) == 0 && stat(path, &expected) == 0 &&
+           actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino;
+}
 
 static const char replacement_manifest[] =
     "[package]\n"
@@ -63,12 +72,11 @@ static int write_file(const char *path, const char *contents)
     return close(descriptor);
 }
 
-static void create_hardlink_after_read(int descriptor)
+static void create_hardlink_after_read(void)
 {
     char error_message[64];
     int error_number;
-    if (descriptor != watched_descriptor || hardlink_attempted ||
-        watched_directory < 0)
+    if (hardlink_attempted || watched_directory < 0)
         return;
     hardlink_attempted = 1;
     if (linkat(watched_directory, watched_component, AT_FDCWD,
@@ -84,26 +92,16 @@ static void create_hardlink_after_read(int descriptor)
     watched_directory = -1;
 }
 
-ssize_t read(int descriptor, void *buffer, size_t size)
+int fstat(int descriptor, struct stat *information)
 {
-    static read_fn real_read;
-    ssize_t result;
-    if (!real_read) real_read = (read_fn)dlsym(RTLD_NEXT, "read");
-    if (!real_read) return -1;
-    result = real_read(descriptor, buffer, size);
-    if (result > 0) create_hardlink_after_read(descriptor);
-    return result;
-}
-
-char *fgets(char *buffer, int size, FILE *stream)
-{
-    static fgets_fn real_fgets;
-    char *result;
-    if (!real_fgets) real_fgets = (fgets_fn)dlsym(RTLD_NEXT, "fgets");
-    if (!real_fgets) return NULL;
-    result = real_fgets(buffer, size, stream);
-    if (result) create_hardlink_after_read(fileno(stream));
-    return result;
+    static fstat_fn real_fstat;
+    if (!real_fstat) real_fstat = (fstat_fn)dlsym(RTLD_NEXT, "fstat");
+    if (!real_fstat) return -1;
+    /* The first fstat validates the open; inject the race at the post-read check. */
+    if (descriptor == watched_descriptor && !hardlink_attempted &&
+        ++watched_fstat_count == 2u)
+        create_hardlink_after_read();
+    return real_fstat(descriptor, information);
 }
 
 int openat(int directory, const char *path, int flags, ...)
@@ -174,13 +172,25 @@ int openat(int directory, const char *path, int flags, ...)
             getenv("RINPACK_TEST_HARDLINK_COMPONENT");
         const char *hardlink_alias = getenv("RINPACK_TEST_HARDLINK_ALIAS");
         const char *hardlink_marker = getenv("RINPACK_TEST_HARDLINK_MARKER");
+        const char *hardlink_root = getenv("RINPACK_TEST_HARDLINK_ROOT");
         if (hardlink_component && hardlink_alias && hardlink_marker &&
+            hardlink_root && is_expected_root(directory) &&
             watched_descriptor < 0 &&
             strcmp(path, hardlink_component) == 0) {
             int descriptor = has_mode
                 ? real_openat(directory, path, flags, mode)
                 : real_openat(directory, path, flags);
             if (descriptor >= 0) {
+                struct stat opened;
+                struct stat named;
+                int opened_ok = fstat(descriptor, &opened) == 0;
+                int named_ok = fstatat(directory, path, &named,
+                                       AT_SYMLINK_NOFOLLOW) == 0;
+                if (!opened_ok || !named_ok ||
+                    !S_ISREG(opened.st_mode) ||
+                    opened.st_dev != named.st_dev ||
+                    opened.st_ino != named.st_ino)
+                    return descriptor;
                 int component_length = snprintf(
                     watched_component, sizeof(watched_component), "%s", path);
                 int alias_length = snprintf(

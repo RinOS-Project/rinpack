@@ -215,11 +215,14 @@ def test_hardlink_added_while_reading(
     env = os.environ.copy()
     env["LD_PRELOAD"] = str(interposer)
     env["RINPACK_TEST_HARDLINK_COMPONENT"] = component
+    env["RINPACK_TEST_HARDLINK_ROOT"] = str(root)
     env["RINPACK_TEST_HARDLINK_ALIAS"] = str(alias)
     env["RINPACK_TEST_HARDLINK_MARKER"] = str(marker)
     result = run_create(binary, manifest, output, env)
     if not marker.exists():
-        raise AssertionError(f"{label} hardlink race hook did not run")
+        raise AssertionError(
+            f"{label} hardlink race hook did not run (stderr={result.stderr.strip()!r})"
+        )
     outcome = marker.read_text(encoding="ascii").strip()
     if outcome.startswith("error="):
         error_number = int(outcome.split("=", 1)[1])
@@ -239,7 +242,11 @@ def test_hardlink_added_while_reading(
     if not alias.exists():
         raise AssertionError(f"{label} hardlink race marker was written without creating its alias")
     if result.returncode == 0 or output.exists():
-        raise AssertionError(f"rinpack published a package after a hardlink appeared while reading {label}")
+        source_links = (root / "payload.bin").stat().st_nlink
+        raise AssertionError(
+            f"rinpack published a package after a hardlink appeared while reading {label} "
+            f"(source links={source_links}, marker={outcome!r}, stderr={result.stderr.strip()!r})"
+        )
     print(f"{label} hardlink added while reading: rejected without publishing a package")
 
 
@@ -297,7 +304,8 @@ def main() -> int:
     interposer = args.interposer.resolve() if args.interposer else None
     if not binary.is_file():
         raise SystemExit(f"rinpack executable does not exist: {binary}")
-    build_root = Path(__file__).resolve().parents[4] / "build" / "rinpack-source-toctou" / "tmp"
+    default_build_root = Path(__file__).resolve().parents[4] / "build" / "rinpack-source-toctou" / "tmp"
+    build_root = Path(os.environ.get("RINPACK_TEST_SCRATCH_ROOT", default_build_root))
     build_root.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="rinpack-source-toctou-", dir=build_root) as temporary:
