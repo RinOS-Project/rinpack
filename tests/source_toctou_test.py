@@ -97,6 +97,31 @@ def link_creation_is_unavailable(error: OSError) -> bool:
 
 def create_directory_reparse(link: Path, target: Path) -> bool:
     if os.name == "nt":
+        # cmd.exe's mklink /J incorrectly reports that local NTFS is required
+        # for some redirected/local temp paths even when the target volume is
+        # NTFS. PowerShell's Junction provider uses the same Windows reparse
+        # point but works for those paths; keep cmd.exe as a compatibility
+        # fallback for systems without the provider.
+        env = os.environ.copy()
+        env["RINPACK_TEST_JUNCTION_PATH"] = str(link)
+        env["RINPACK_TEST_JUNCTION_TARGET"] = str(target)
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction "
+                "-Path $env:RINPACK_TEST_JUNCTION_PATH "
+                "-Target $env:RINPACK_TEST_JUNCTION_TARGET | Out-Null",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+        if result.returncode == 0 and link.is_dir():
+            return True
+        if link.exists():
+            link.rmdir()
         result = subprocess.run(
             ["cmd.exe", "/d", "/c", f'mklink /J "{link}" "{target}"'],
             check=False,
