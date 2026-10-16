@@ -40,7 +40,7 @@ source = "{source}"
 
 TRUSTED = b"trusted bytes from the opened source root\n"
 ATTACKER = b"attacker-controlled replacement\n"
-MAX_SOURCE = 32 * 1024 * 1024
+MAX_SOURCE = 64 * 1024 * 1024
 
 
 def run_create(binary: Path, manifest: Path, output: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

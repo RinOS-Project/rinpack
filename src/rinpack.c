@@ -55,7 +55,7 @@
 #define PKG_MAX_DEPS 8u
 #define PKG_MAX_CAPABILITIES 31u
 #define PKG_MAX_TOTAL_SIZE (256u * 1024u * 1024u)
-#define PKG_MAX_FILE_SIZE (32u * 1024u * 1024u)
+#define PKG_MAX_FILE_SIZE (64u * 1024u * 1024u)
 #define PKG_PATH_MAX 192u
 #define PKG_NAME_MAX 64u
 #define PKG_VERSION_MAX 32u
