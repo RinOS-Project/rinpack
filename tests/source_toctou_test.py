@@ -351,7 +351,15 @@ def main() -> int:
         except OSError as error:
             if not link_creation_is_unavailable(error):
                 raise
-            required_skipped.append("symlink source check (filesystem does not permit symlink creation)")
+            if os.name == "nt":
+                skipped.append(
+                    "file symlink source check (Windows requires Administrator privilege; "
+                    "POSIX acceptance exercises file and directory symlink races)"
+                )
+            else:
+                required_skipped.append(
+                    "symlink source check (filesystem does not permit symlink creation)"
+                )
         else:
             assert_rejected(binary, symlink_manifest, base / "symlink.rpk", "a source symlink")
 
