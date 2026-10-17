@@ -1238,6 +1238,7 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
                                  FILE_FLAG_SEQUENTIAL_SCAN,
                              NULL);
         if (handle == INVALID_HANDLE_VALUE ||
+            GetFileType(handle) != FILE_TYPE_DISK ||
             !GetFileInformationByHandle(handle, &info) ||
             (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
                                       FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
