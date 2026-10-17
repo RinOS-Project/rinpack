@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 
 MANIFEST = '''[package]
@@ -320,10 +321,236 @@ def test_component_symlink_swap(
     print(f"{label} component changed to a symlink while opening: rejected without publishing a package")
 
 
+def start_paused_create(
+    binary: Path, manifest: Path, output: Path, base: Path,
+    stage: str, source: str,
+) -> tuple[subprocess.Popen[str], Path, Path]:
+    marker = base / f"windows-{stage}.marker"
+    release = base / f"windows-{stage}.release"
+    env = os.environ.copy()
+    env["RINPACK_TEST_PAUSE_STAGE"] = stage
+    env["RINPACK_TEST_PAUSE_SOURCE"] = source
+    env["RINPACK_TEST_PAUSE_MARKER"] = str(marker)
+    env["RINPACK_TEST_PAUSE_RELEASE"] = str(release)
+    process = subprocess.Popen(
+        [str(binary), "create", "--manifest", str(manifest),
+         "--output", str(output), "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        if marker.exists():
+            return process, marker, release
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                "Windows race hook exited before pausing "
+                f"(code={process.returncode}, stdout={stdout!r}, stderr={stderr!r})"
+            )
+        time.sleep(0.01)
+    process.kill()
+    stdout, stderr = process.communicate()
+    raise AssertionError(
+        "Windows race hook did not pause within 15 seconds "
+        f"(stdout={stdout!r}, stderr={stderr!r})"
+    )
+
+
+def finish_paused_create(
+    process: subprocess.Popen[str], release: Path,
+) -> subprocess.CompletedProcess[str]:
+    release.write_bytes(b"continue\n")
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        raise AssertionError(
+            f"paused Windows RinPack process did not finish: {stderr.strip()!r}"
+        )
+    return subprocess.CompletedProcess(
+        process.args, process.returncode, stdout, stderr,
+    )
+
+
+def test_windows_reparse_swap_race(
+    binary: Path, base: Path, required_skipped: list[str],
+) -> None:
+    root = base / "windows-reparse-race"
+    manifest = write_fixture(root, "nested/payload.bin")
+    nested = root / "nested"
+    nested.mkdir()
+    (nested / "payload.bin").write_bytes(TRUSTED)
+    attacker = base / "windows-reparse-attacker"
+    attacker.mkdir()
+    (attacker / "payload.bin").write_bytes(ATTACKER)
+    probe = base / "windows-reparse-probe"
+    if not create_directory_reparse(probe, attacker):
+        required_skipped.append(
+            "Windows directory reparse race (fixture filesystem does not support junctions)"
+        )
+        return
+    probe.rmdir()
+
+    process, _, release = start_paused_create(
+        binary, manifest, base / "windows-reparse-race.rpk", base,
+        "before-open", "nested/payload.bin",
+    )
+    held = root / "nested.rinpack-held"
+    reparse = root / "nested"
+    created = False
+    try:
+        nested.rename(held)
+        created = create_directory_reparse(reparse, attacker)
+        if not created:
+            held.rename(nested)
+            required_skipped.append(
+                "Windows directory reparse race (fixture filesystem rejected junction creation)"
+            )
+        result = finish_paused_create(process, release)
+        if created:
+            if result.returncode == 0 or (base / "windows-reparse-race.rpk").exists():
+                raise AssertionError(
+                    "rinpack followed a directory junction installed after path validation"
+                )
+            print("Windows directory reparse swap: rejected without publishing a package")
+    finally:
+        if process.poll() is None:
+            release.write_bytes(b"continue\n")
+            process.kill()
+            process.communicate()
+        if created and reparse.exists():
+            reparse.rmdir()
+        if held.exists() and not nested.exists():
+            held.rename(nested)
+
+
+def test_windows_root_path_replacement(
+    binary: Path, base: Path,
+) -> None:
+    root = base / "windows-root-swap"
+    manifest = write_fixture(root, "payload.bin")
+    (root / "payload.bin").write_bytes(TRUSTED)
+    output = base / "windows-root-swap.rpk"
+    process, _, release = start_paused_create(
+        binary, manifest, output, base, "before-open", "payload.bin",
+    )
+    held = base / "windows-root-swap.held"
+    moved = False
+    try:
+        try:
+            root.rename(held)
+            moved = True
+        except OSError as error:
+            if getattr(error, "winerror", None) != 32:
+                raise
+        if moved:
+            root.mkdir()
+            (root / "payload.bin").write_bytes(ATTACKER)
+        result = finish_paused_create(process, release)
+        if moved:
+            if result.returncode == 0 or output.exists():
+                raise AssertionError(
+                    "rinpack accepted a source opened through a replaced root path"
+                )
+            print("Windows source-root replacement: rejected without publishing a package")
+        else:
+            if result.returncode != 0 or not output.is_file():
+                raise AssertionError(
+                    "Windows source-root handle blocked rename but valid source was rejected: "
+                    f"{result.stderr.strip()!r}"
+                )
+            inspection = json.loads(result.stdout)
+            entry = next(
+                item for item in inspection["entries"]
+                if item["path"] == "data/payload.bin"
+            )
+            if entry["sha256"] != hashlib.sha256(TRUSTED).hexdigest():
+                raise AssertionError(
+                    "Windows source-root rename protection did not retain the opened root"
+                )
+            print("Windows source-root replacement: held directory handle blocked rename")
+    finally:
+        if process.poll() is None:
+            release.write_bytes(b"continue\n")
+            process.kill()
+            process.communicate()
+        if moved:
+            replacement = root / "payload.bin"
+            if replacement.exists():
+                replacement.unlink()
+            root.rmdir()
+            if held.exists():
+                held.rename(root)
+
+
+def test_windows_hardlink_added_while_reading(
+    binary: Path, base: Path, required_skipped: list[str],
+) -> None:
+    root = base / "windows-hardlink-race"
+    manifest = write_fixture(root, "payload.bin")
+    source = root / "payload.bin"
+    source.write_bytes(TRUSTED)
+    alias = base / "windows-hardlink-race.alias"
+    output = base / "windows-hardlink-race.rpk"
+    process, _, release = start_paused_create(
+        binary, manifest, output, base, "opened", "payload.bin",
+    )
+    created = False
+    try:
+        try:
+            os.link(source, alias)
+            created = True
+        except OSError as error:
+            if getattr(error, "winerror", None) == 32:
+                result = finish_paused_create(process, release)
+                if result.returncode != 0 or not output.is_file():
+                    raise AssertionError(
+                        "Windows sharing prevented a racing hardlink, but RinPack "
+                        f"rejected the unchanged source: {result.stderr.strip()!r}"
+                    )
+                print("Windows hardlink race: opened handle prevented a new alias")
+                return
+            if not link_creation_is_unavailable(error):
+                raise
+            detail = (
+                f"{type(error).__name__} errno={error.errno} "
+                f"winerror={getattr(error, 'winerror', None)}"
+            )
+            required_skipped.append(
+                "Windows hardlink added while reading "
+                f"(filesystem does not permit hardlinks: {detail})"
+            )
+            result = finish_paused_create(process, release)
+            if result.returncode != 0 or not output.is_file():
+                raise AssertionError(
+                    "Windows hardlink fixture was unavailable and unchanged source "
+                    f"was rejected: {result.stderr.strip()!r}"
+                )
+            return
+        result = finish_paused_create(process, release)
+        if result.returncode == 0 or output.exists():
+            raise AssertionError(
+                "rinpack published a package after a hardlink appeared while reading"
+            )
+        print("Windows hardlink added while reading: rejected without publishing a package")
+    finally:
+        if process.poll() is None:
+            release.write_bytes(b"continue\n")
+            process.kill()
+            process.communicate()
+        if created and alias.exists():
+            alias.unlink()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--interposer", type=Path)
+    parser.add_argument("--windows-test-hooks", action="store_true")
     args = parser.parse_args()
     binary = args.binary.resolve()
     interposer = args.interposer.resolve() if args.interposer else None
@@ -399,6 +626,15 @@ def main() -> int:
         assert_rejected(binary, large_manifest, base / "oversized.rpk", "a source over the size limit")
 
         test_hardlink_aliases(binary, base, required_skipped)
+
+        if args.windows_test_hooks:
+            if os.name != "nt":
+                raise AssertionError("Windows test hooks require a Windows host")
+            test_windows_root_path_replacement(binary, base)
+            test_windows_reparse_swap_race(binary, base, required_skipped)
+            test_windows_hardlink_added_while_reading(
+                binary, base, required_skipped,
+            )
 
         if interposer is not None:
             test_root_path_replacement(binary, interposer, base)

@@ -1141,6 +1141,35 @@ static int source_path_valid(const char *path)
 }
 
 #ifdef _WIN32
+#if defined(RINPACK_TESTING)
+/* Windows has no LD_PRELOAD equivalent for the source-open races. The
+ * Windows-only acceptance binary can pause at the two security boundaries so
+ * its Python driver can mutate the fixture deterministically. This hook is
+ * absent from normal RinPack builds. */
+static int source_test_pause(const char *stage, const char *source)
+{
+    const char *test_stage = getenv("RINPACK_TEST_PAUSE_STAGE");
+    const char *test_source = getenv("RINPACK_TEST_PAUSE_SOURCE");
+    const char *marker_path = getenv("RINPACK_TEST_PAUSE_MARKER");
+    const char *release_path = getenv("RINPACK_TEST_PAUSE_RELEASE");
+    FILE *marker;
+    unsigned attempt;
+    if (!test_stage || !test_source || !marker_path || !release_path ||
+        strcmp(test_stage, stage) != 0 || strcmp(test_source, source) != 0)
+        return 0;
+    marker = fopen(marker_path, "wb");
+    if (!marker) return failf2("cannot create test pause marker", marker_path);
+    if (fclose(marker) != 0)
+        return failf2("cannot close test pause marker", marker_path);
+    for (attempt = 0u; attempt < 6000u; ++attempt) {
+        if (GetFileAttributesA(release_path) != INVALID_FILE_ATTRIBUTES)
+            return 0;
+        Sleep(10u);
+    }
+    return failf2("test pause timed out", source);
+}
+#endif
+
 static int source_read_file(PackageSourceRoot *root, PackageFile *file)
 {
     char source[PKG_PATH_MAX];
@@ -1160,6 +1189,9 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
         source_path_valid(file->source) != 0)
         return -1;
     strcpy(source, file->source);
+#if defined(RINPACK_TESTING)
+    if (source_test_pause("before-open", file->source) != 0) goto done;
+#endif
     strcpy(current_path, root->path);
     component = source;
     for (;;) {
@@ -1220,6 +1252,9 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
             goto done;
         }
     }
+#if defined(RINPACK_TESTING)
+    if (source_test_pause("opened", file->source) != 0) goto done;
+#endif
     data = (uint8_t *)malloc(initial_size.QuadPart ?
                              (size_t)initial_size.QuadPart : 1u);
     if (!data) {

@@ -39,8 +39,8 @@ clean:
 
 ifeq ($(OS),Windows_NT)
 check-source-toctou: src/rinpack.c | $(TEST_BUILD_DIR)
-	$(CC) $(CFLAGS) -o $(TEST_BUILD_DIR)/rinpack-source-toctou.exe $< $(LDLIBS)
-	python tests/source_toctou_test.py --binary $(TEST_BUILD_DIR)/rinpack-source-toctou.exe
+	$(CC) $(CFLAGS) -DRINPACK_TESTING -o $(TEST_BUILD_DIR)/rinpack-source-toctou.exe $< $(LDLIBS)
+	python tests/source_toctou_test.py --binary $(TEST_BUILD_DIR)/rinpack-source-toctou.exe --windows-test-hooks
 else
 check-source-toctou: src/rinpack.c tests/source_root_swap_interposer.c | $(TEST_BUILD_DIR)
 	$(CC) $(CFLAGS) -o $(TEST_BUILD_DIR)/rinpack-source-toctou $< $(LDLIBS)
