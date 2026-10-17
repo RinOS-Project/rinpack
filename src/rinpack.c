@@ -1187,6 +1187,7 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
     char *component;
     HANDLE handle = INVALID_HANDLE_VALUE;
     BY_HANDLE_FILE_INFORMATION info;
+    BY_HANDLE_FILE_INFORMATION opened_info;
     LARGE_INTEGER initial_size;
     LARGE_INTEGER final_size;
     uint8_t *data = NULL;
@@ -1259,6 +1260,11 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
                    file->source);
             goto done;
         }
+        /* The parent path is no longer needed after the final component is
+         * opened, so retain the exact candidate for the post-read name check
+         * without adding another path-sized stack buffer. */
+        strcpy(current_path, candidate);
+        opened_info = info;
     }
 #if defined(RINPACK_TESTING)
     if (source_test_pause("opened", file->source) != 0) goto done;
@@ -1281,13 +1287,50 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
     {
         uint8_t extra;
         DWORD count = 0u;
+        char resolved[2048];
+        BY_HANDLE_FILE_INFORMATION named_info;
+        HANDLE named_handle;
+        int matches;
         if (!ReadFile(handle, &extra, 1u, &count, NULL) || count != 0u ||
+            !source_handle_is_disk(handle) ||
             !GetFileInformationByHandle(handle, &info) ||
+            (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                      FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
             info.nNumberOfLinks != 1u ||
             !GetFileSizeEx(handle, &final_size) ||
             final_size.QuadPart != initial_size.QuadPart ||
+            info.dwVolumeSerialNumber != opened_info.dwVolumeSerialNumber ||
+            info.nFileIndexHigh != opened_info.nFileIndexHigh ||
+            info.nFileIndexLow != opened_info.nFileIndexLow ||
+            source_handle_path(handle, resolved, sizeof(resolved)) != 0 ||
+            !source_path_is_beneath(root->path, resolved) ||
             !source_root_path_matches(root)) {
             failf2("source changed while being read", file->source);
+            goto done;
+        }
+        named_handle = CreateFileA(current_path, FILE_READ_ATTRIBUTES,
+                                   FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                   FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (named_handle == INVALID_HANDLE_VALUE) {
+            failf2("source name changed while being read", file->source);
+            goto done;
+        }
+        matches = source_handle_is_disk(named_handle) &&
+                  GetFileInformationByHandle(named_handle, &named_info) &&
+                  (named_info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                                  FILE_ATTRIBUTE_REPARSE_POINT)) == 0u &&
+                  named_info.nNumberOfLinks == 1u &&
+                  named_info.dwVolumeSerialNumber ==
+                      opened_info.dwVolumeSerialNumber &&
+                  named_info.nFileIndexHigh == opened_info.nFileIndexHigh &&
+                  named_info.nFileIndexLow == opened_info.nFileIndexLow &&
+                  source_handle_path(named_handle, resolved,
+                                     sizeof(resolved)) == 0 &&
+                  source_path_is_beneath(root->path, resolved) &&
+                  source_root_path_matches(root);
+        if (!CloseHandle(named_handle)) matches = 0;
+        if (!matches) {
+            failf2("source name changed while being read", file->source);
             goto done;
         }
     }
