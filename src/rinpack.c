@@ -803,6 +803,12 @@ static int version_compare(const char *left, const char *right) {
 }
 
 #ifdef _WIN32
+static int source_handle_is_disk(HANDLE handle)
+{
+    return handle != NULL && handle != INVALID_HANDLE_VALUE &&
+           GetFileType(handle) == FILE_TYPE_DISK;
+}
+
 static int source_handle_path(HANDLE handle, char *path, size_t capacity)
 {
     DWORD length;
@@ -890,7 +896,7 @@ static int source_root_open(PackageSourceRoot *root, const char *path)
                                FILE_FLAG_BACKUP_SEMANTICS |
                                    FILE_FLAG_OPEN_REPARSE_POINT,
                                NULL);
-    if (root->handle == INVALID_HANDLE_VALUE ||
+    if (!source_handle_is_disk(root->handle) ||
         !GetFileInformationByHandle(root->handle, &info) ||
         (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0u ||
         (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u ||
@@ -929,7 +935,7 @@ static int source_root_path_matches(PackageSourceRoot *root)
         BY_HANDLE_FILE_INFORMATION current;
         HANDLE handle;
         int matches;
-        if (root->handle == INVALID_HANDLE_VALUE ||
+        if (!source_handle_is_disk(root->handle) ||
             !GetFileInformationByHandle(root->handle, &held))
             return 0;
         handle = CreateFileA(root->path, FILE_READ_ATTRIBUTES,
@@ -939,7 +945,8 @@ static int source_root_path_matches(PackageSourceRoot *root)
                                  FILE_FLAG_OPEN_REPARSE_POINT,
                              NULL);
         if (handle == INVALID_HANDLE_VALUE) return 0;
-        matches = GetFileInformationByHandle(handle, &current) &&
+        matches = source_handle_is_disk(handle) &&
+                  GetFileInformationByHandle(handle, &current) &&
                   (current.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0u &&
                   (current.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0u &&
                   current.dwVolumeSerialNumber == held.dwVolumeSerialNumber &&
@@ -988,11 +995,11 @@ static int source_manifest_stream_matches(PackageSourceRoot *root,
         if (raw_handle == -1 || root->handle == INVALID_HANDLE_VALUE)
             return 0;
         opened_handle = (HANDLE)raw_handle;
-        if (!GetFileInformationByHandle(opened_handle, &opened) ||
+        if (!source_handle_is_disk(opened_handle) ||
+            !GetFileInformationByHandle(opened_handle, &opened) ||
             (opened.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
                                         FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
             opened.nNumberOfLinks != 1u ||
-            GetFileType(opened_handle) != FILE_TYPE_DISK ||
             !GetFileSizeEx(opened_handle, &size) || size.QuadPart < 0 ||
             (uint64_t)size.QuadPart > PKG_MANIFEST_MAX_SIZE ||
             source_handle_path(opened_handle, resolved, sizeof(resolved)) != 0 ||
@@ -1005,7 +1012,8 @@ static int source_manifest_stream_matches(PackageSourceRoot *root,
                                    FILE_SHARE_READ, NULL, OPEN_EXISTING,
                                    FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         if (named_handle == INVALID_HANDLE_VALUE) return 0;
-        matches = GetFileInformationByHandle(named_handle, &named) &&
+        matches = source_handle_is_disk(named_handle) &&
+                  GetFileInformationByHandle(named_handle, &named) &&
                   (named.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
                                              FILE_ATTRIBUTE_REPARSE_POINT)) == 0u &&
                   named.nNumberOfLinks == 1u &&
@@ -1082,11 +1090,11 @@ static FILE *source_open_manifest_stream(PackageSourceRoot *root,
                                  FILE_FLAG_SEQUENTIAL_SCAN,
                              NULL);
         if (handle == INVALID_HANDLE_VALUE) return NULL;
-        if (!GetFileInformationByHandle(handle, &info) ||
+        if (!source_handle_is_disk(handle) ||
+            !GetFileInformationByHandle(handle, &info) ||
             (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
                                       FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
             info.nNumberOfLinks != 1u ||
-            GetFileType(handle) != FILE_TYPE_DISK ||
             !GetFileSizeEx(handle, &size) || size.QuadPart < 0 ||
             (uint64_t)size.QuadPart > PKG_MANIFEST_MAX_SIZE ||
             source_handle_path(handle, resolved, sizeof(resolved)) != 0 ||
@@ -1212,7 +1220,7 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
                                 FILE_FLAG_BACKUP_SEMANTICS |
                                     FILE_FLAG_OPEN_REPARSE_POINT,
                                 NULL);
-        if (directory == INVALID_HANDLE_VALUE ||
+        if (!source_handle_is_disk(directory) ||
             !GetFileInformationByHandle(directory, &info) ||
             (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0u ||
             (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u ||
@@ -1237,8 +1245,7 @@ static int source_read_file(PackageSourceRoot *root, PackageFile *file)
                              FILE_FLAG_OPEN_REPARSE_POINT |
                                  FILE_FLAG_SEQUENTIAL_SCAN,
                              NULL);
-        if (handle == INVALID_HANDLE_VALUE ||
-            GetFileType(handle) != FILE_TYPE_DISK ||
+        if (!source_handle_is_disk(handle) ||
             !GetFileInformationByHandle(handle, &info) ||
             (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
                                       FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
