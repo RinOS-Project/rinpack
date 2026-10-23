@@ -1811,7 +1811,7 @@ static int make_file_identity_metadata(const Manifest *manifest, Buffer *out) {
         if (is_executable) {
             uint32_t page_count = 0u;
             uint32_t proof_depth = 0u;
-            uint32_t image_size = get32(file->data, 12u);
+            uint64_t image_size = get64(file->data, 44u);
             if (image_size > file->size || image_size < RIN_IMAGE_HEADER_SIZE)
                 goto done;
             memcpy(record + 232u, file->data + 116u, 32u);

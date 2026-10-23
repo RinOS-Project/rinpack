@@ -15,10 +15,12 @@ ifeq ($(OS),Windows_NT)
 MKDIR_P = if not exist "$(1)" mkdir "$(1)"
 RM_RF = if exist "$(1)" rmdir /s /q "$(1)"
 RM_F = if exist "$(1)" del /q "$(1)"
+RFIM_TEST_BINARY = $(TEST_BUILD_DIR)/rinpack-file-identity-proofs.exe
 else
 MKDIR_P = mkdir -p "$(1)"
 RM_RF = rm -rf "$(1)"
 RM_F = rm -f "$(1)"
+RFIM_TEST_BINARY = $(TEST_BUILD_DIR)/rinpack-file-identity-proofs
 endif
 
 all: rinpack
@@ -48,7 +50,11 @@ check-source-toctou: src/rinpack.c tests/source_root_swap_interposer.c | $(TEST_
 	python3 tests/source_toctou_test.py --binary $(TEST_BUILD_DIR)/rinpack-source-toctou --interposer $(TEST_BUILD_DIR)/source_root_swap.so
 endif
 
+check-file-identity-proofs: src/rinpack.c tests/file_identity_proofs_test.py | $(TEST_BUILD_DIR)
+	$(CC) $(CFLAGS) -o $(RFIM_TEST_BINARY) src/rinpack.c $(LDLIBS)
+	python tests/file_identity_proofs_test.py --binary $(RFIM_TEST_BINARY)
+
 $(TEST_BUILD_DIR):
 	$(call MKDIR_P,$@)
 
-.PHONY: all clean check-source-toctou
+.PHONY: all clean check-source-toctou check-file-identity-proofs
