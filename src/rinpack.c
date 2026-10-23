@@ -70,6 +70,10 @@
 #define PKG_DEPENDENCY_MAGIC UINT32_C(0x50454452)
 #define PKG_CAPABILITY_MAGIC UINT32_C(0x50414352)
 #define PKG_FILE_IDENTITY_MAGIC UINT32_C(0x4d494652)
+#define PKG_FILE_IDENTITY_VERSION UINT16_C(2)
+#define PKG_FILE_IDENTITY_ENTRY_V2_SIZE 316u
+#define PKG_FILE_IDENTITY_PAGE_SIZE 4096u
+#define PKG_FILE_IDENTITY_MAX_PROOF_BYTES (32u * 1024u * 1024u)
 #define PKG_MANIFEST_MAGIC UINT32_C(0x314d5052)
 #define RIN_SIGNATURE_MAGIC UINT32_C(0x31534452)
 
@@ -1671,32 +1675,204 @@ static int make_capability_metadata(const Manifest *manifest, const uint8_t key_
     return buffer_append(out, data, sizeof(data));
 }
 
+static int rdm3_leaf_digest(uint32_t index, uint32_t size,
+                            const uint8_t chunk_digest[32],
+                            uint8_t output[32]) {
+    static const uint8_t domain[] = "RinOS-RDM3-leaf";
+    uint8_t input[sizeof(domain) + 8u + 4u + 32u];
+    size_t position = 0u;
+    memcpy(input + position, domain, sizeof(domain));
+    position += sizeof(domain);
+    put32(input, position, index);
+    position += 4u;
+    put32(input, position, 0u);
+    position += 4u;
+    put32(input, position, size);
+    position += 4u;
+    memcpy(input + position, chunk_digest, 32u);
+    return checked_sha256(input, sizeof(input), output);
+}
+
+static int rdm3_parent_digest(const uint8_t left[32],
+                              const uint8_t right[32],
+                              uint8_t output[32]) {
+    static const uint8_t domain[] = "RinOS-RDM3-node";
+    uint8_t input[sizeof(domain) + 64u];
+    memcpy(input, domain, sizeof(domain));
+    memcpy(input + sizeof(domain), left, 32u);
+    memcpy(input + sizeof(domain) + 32u, right, 32u);
+    return checked_sha256(input, sizeof(input), output);
+}
+
+static int make_file_page_proofs(const PackageFile *file, Buffer *proofs,
+                                 uint32_t *page_count_out,
+                                 uint32_t *proof_depth_out,
+                                 uint8_t root_out[32]) {
+    size_t page_count;
+    size_t capacity = 1u;
+    size_t tree_bytes;
+    uint8_t *tree = NULL;
+    uint8_t chunk_digest[32];
+    uint8_t zero_digest[32] = {0};
+    uint32_t depth = 0u;
+    int result = -1;
+
+    if (!file || !proofs || !page_count_out || !proof_depth_out ||
+        !root_out || file->size == 0u) return -1;
+    page_count = (file->size + PKG_FILE_IDENTITY_PAGE_SIZE - 1u) /
+                 PKG_FILE_IDENTITY_PAGE_SIZE;
+    if (page_count == 0u || page_count > UINT32_MAX) return -1;
+    while (capacity < page_count) {
+        if (capacity > SIZE_MAX / 2u) return -1;
+        capacity <<= 1u;
+        ++depth;
+    }
+    if (depth > 24u || capacity > SIZE_MAX / 64u) return -1;
+    tree_bytes = capacity * 2u * 32u;
+    tree = (uint8_t*)calloc(1u, tree_bytes);
+    if (!tree) return failf("out of memory building executable page proofs");
+
+    for (size_t page = 0u; page < capacity; ++page) {
+        uint8_t *leaf = tree + (capacity + page) * 32u;
+        if (page < page_count) {
+            size_t offset = page * PKG_FILE_IDENTITY_PAGE_SIZE;
+            size_t amount = file->size - offset;
+            if (amount > PKG_FILE_IDENTITY_PAGE_SIZE)
+                amount = PKG_FILE_IDENTITY_PAGE_SIZE;
+            if (checked_sha256(file->data + offset, amount,
+                               chunk_digest) != 0) goto done;
+            if (rdm3_leaf_digest((uint32_t)page, (uint32_t)amount,
+                                 chunk_digest, leaf) != 0)
+                goto done;
+        } else {
+            if (rdm3_leaf_digest((uint32_t)page, 0u, zero_digest, leaf) != 0)
+                goto done;
+        }
+    }
+    for (size_t node = capacity; node-- > 1u;) {
+        if (rdm3_parent_digest(tree + (node * 2u) * 32u,
+                               tree + (node * 2u + 1u) * 32u,
+                               tree + node * 32u) != 0)
+            goto done;
+    }
+    for (size_t page = 0u; page < page_count; ++page) {
+        size_t node = capacity + page;
+        for (uint32_t level = 0u; level < depth; ++level) {
+            if (buffer_append(proofs, tree + (node ^ 1u) * 32u, 32u) != 0)
+                goto done;
+            node >>= 1u;
+        }
+    }
+    *page_count_out = (uint32_t)page_count;
+    *proof_depth_out = depth;
+    memcpy(root_out, tree + 32u, 32u);
+    result = 0;
+
+done:
+    free(tree);
+    memset(chunk_digest, 0, sizeof(chunk_digest));
+    if (result != 0) buffer_free(proofs);
+    return result;
+}
+
 static int make_file_identity_metadata(const Manifest *manifest, Buffer *out) {
     uint8_t header[32];
+    uint8_t (*records)[PKG_FILE_IDENTITY_ENTRY_V2_SIZE] = NULL;
+    Buffer proofs[PKG_MAX_FILES] = {{0}};
     size_t index;
-    memset(header, 0, sizeof(header));
-    put32(header, 0, PKG_FILE_IDENTITY_MAGIC);
-    put16(header, 4, 1);
-    put16(header, 6, 32);
-    put32(header, 8, (uint32_t)manifest->file_count);
-    put32(header, 12, 264);
-    if (buffer_append(out, header, sizeof(header)) != 0) return -1;
+    uint64_t proof_cursor;
+    uint64_t total_proof_bytes = 0u;
+    int result = -1;
+
+    if (!manifest || !out || manifest->file_count == 0u ||
+        manifest->file_count > PKG_MAX_FILES ||
+        manifest->file_count >
+            (SIZE_MAX - sizeof(header)) / PKG_FILE_IDENTITY_ENTRY_V2_SIZE)
+        return -1;
+    records = (uint8_t (*)[PKG_FILE_IDENTITY_ENTRY_V2_SIZE])calloc(
+        manifest->file_count, PKG_FILE_IDENTITY_ENTRY_V2_SIZE);
+    if (!records) return failf("out of memory building file identity records");
+
     for (index = 0; index < manifest->file_count; ++index) {
-        uint8_t record[264];
+        const PackageFile *file = &manifest->files[index];
+        uint8_t *record = records[index];
         uint8_t digest[32];
-        memset(record, 0, sizeof(record));
-        memcpy(record, manifest->files[index].path, strlen(manifest->files[index].path));
-        put64(record, 192, manifest->files[index].size);
-        if (checked_sha256(manifest->files[index].data,
-                           manifest->files[index].size, digest) != 0)
-            return -1;
-        memcpy(record + 200, digest, sizeof(digest));
-        if (manifest->files[index].size >= RIN_IMAGE_HEADER_SIZE && get32(manifest->files[index].data, 0) == RIN_IMAGE_MAGIC && get32(manifest->files[index].data, 4) == RIN_IMAGE_VERSION_V3 && get16(manifest->files[index].data, 8) == RIN_IMAGE_HEADER_SIZE && (get32(manifest->files[index].data, 16) & RIN_IMAGE_EXECUTABLE) != 0u)
-            memcpy(record + 232, manifest->files[index].data + 116, 32);
-        if (buffer_append(out, record, sizeof(record)) != 0) return -1;
+        int is_executable =
+            file->size >= RIN_IMAGE_HEADER_SIZE &&
+            get32(file->data, 0) == RIN_IMAGE_MAGIC &&
+            get32(file->data, 4) == RIN_IMAGE_VERSION_V3 &&
+            get16(file->data, 8) == RIN_IMAGE_HEADER_SIZE &&
+            (get32(file->data, 16) & RIN_IMAGE_EXECUTABLE) != 0u;
+
+        memcpy(record, file->path, strlen(file->path));
+        put64(record, 192u, file->size);
+        if (checked_sha256(file->data, file->size, digest) != 0) goto done;
+        memcpy(record + 200u, digest, sizeof(digest));
+        if (is_executable) {
+            uint32_t page_count = 0u;
+            uint32_t proof_depth = 0u;
+            uint32_t image_size = get32(file->data, 12u);
+            if (image_size > file->size || image_size < RIN_IMAGE_HEADER_SIZE)
+                goto done;
+            memcpy(record + 232u, file->data + 116u, 32u);
+            if (make_file_page_proofs(file, &proofs[index], &page_count,
+                                      &proof_depth, digest) != 0)
+                goto done;
+            put32(record, 264u, PKG_FILE_IDENTITY_PAGE_SIZE);
+            put32(record, 268u, page_count);
+            put32(record, 272u, proof_depth);
+            memcpy(record + 284u, digest, 32u);
+        }
+        memset(digest, 0, sizeof(digest));
+        if (proofs[index].size > PKG_FILE_IDENTITY_MAX_PROOF_BYTES -
+                                     total_proof_bytes)
+            goto done;
+        total_proof_bytes += proofs[index].size;
     }
-    put32(out->data, 16, crc32_bytes(out->data, out->size));
-    return 0;
+
+    proof_cursor = sizeof(header) +
+                   manifest->file_count * PKG_FILE_IDENTITY_ENTRY_V2_SIZE;
+    for (index = 0; index < manifest->file_count; ++index) {
+        uint8_t *record = records[index];
+        if (get32(record, 268u) != 0u) {
+            if (proof_cursor > UINT32_MAX || proofs[index].size > UINT32_MAX ||
+                proof_cursor + proofs[index].size > UINT32_MAX)
+                goto done;
+            put32(record, 276u, (uint32_t)proof_cursor);
+            put32(record, 280u, (uint32_t)proofs[index].size);
+            proof_cursor += proofs[index].size;
+        }
+    }
+
+    memset(header, 0, sizeof(header));
+    put32(header, 0u, PKG_FILE_IDENTITY_MAGIC);
+    put16(header, 4u, PKG_FILE_IDENTITY_VERSION);
+    put16(header, 6u, sizeof(header));
+    put32(header, 8u, (uint32_t)manifest->file_count);
+    put32(header, 12u, PKG_FILE_IDENTITY_ENTRY_V2_SIZE);
+    if (buffer_append(out, header, sizeof(header)) != 0 ||
+        buffer_append(out, records,
+                      manifest->file_count *
+                          PKG_FILE_IDENTITY_ENTRY_V2_SIZE) != 0)
+        goto done;
+    for (index = 0; index < manifest->file_count; ++index) {
+        if (buffer_append(out, proofs[index].data, proofs[index].size) != 0)
+            goto done;
+    }
+    if (out->size > sizeof(header) +
+                        manifest->file_count *
+                            PKG_FILE_IDENTITY_ENTRY_V2_SIZE +
+                        PKG_FILE_IDENTITY_MAX_PROOF_BYTES)
+        goto done;
+    put32(out->data, 16u, crc32_bytes(out->data, out->size));
+    result = 0;
+
+done:
+    for (index = 0; index < manifest->file_count; ++index)
+        buffer_free(&proofs[index]);
+    free(records);
+    if (result != 0) buffer_free(out);
+    return result;
 }
 
 static uint16_t manifest_architecture(const char *value) {
