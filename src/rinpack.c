@@ -80,6 +80,7 @@
 #define RIN_IMAGE_MAGIC UINT32_C(0x004e4952)
 #define RIN_IMAGE_VERSION_V3 UINT32_C(0x00030000)
 #define RIN_IMAGE_HEADER_SIZE 256u
+#define RIN_IMAGE_MAX_MEMORY_SIZE (UINT64_C(512) * 1024u * 1024u)
 #define RIN_IMAGE_EXECUTABLE UINT32_C(1)
 
 #define MAX_LINE 8192u
@@ -1812,8 +1813,11 @@ static int make_file_identity_metadata(const Manifest *manifest, Buffer *out) {
             uint32_t page_count = 0u;
             uint32_t proof_depth = 0u;
             uint64_t image_size = get64(file->data, 44u);
-            if (image_size > file->size || image_size < RIN_IMAGE_HEADER_SIZE)
+            if (image_size < RIN_IMAGE_HEADER_SIZE ||
+                image_size > RIN_IMAGE_MAX_MEMORY_SIZE) {
+                failf("RIN v3 executable memory image size is outside loader bounds");
                 goto done;
+            }
             memcpy(record + 232u, file->data + 116u, 32u);
             if (make_file_page_proofs(file, &proofs[index], &page_count,
                                       &proof_depth, digest) != 0)

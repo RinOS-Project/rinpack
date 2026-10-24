@@ -25,6 +25,7 @@ PAGE_SIZE = 4096
 RIN_IMAGE_MAGIC = 0x004E4952
 RIN_IMAGE_VERSION_3 = 0x00030000
 RIN_IMAGE_EXECUTABLE = 1
+RIN_MAX_IMAGE_SIZE = 512 * 1024 * 1024
 
 
 def fail(message: str) -> None:
@@ -96,9 +97,10 @@ def make_executable() -> bytes:
     struct.pack_into("<H", image, 12, 1)  # ABI major
     struct.pack_into("<H", image, 14, 4)  # ABI minor
     struct.pack_into("<I", image, 16, RIN_IMAGE_EXECUTABLE)
-    # RinHeaderV3.image_size is a 64-bit field at byte offset 44. Its ABI
-    # fields at offset 12 deliberately make a mistaken get32(offset 12) fail.
-    struct.pack_into("<Q", image, 44, len(image))
+    # RinHeaderV3.image_size is the loaded memory extent, not the serialized
+    # file length: this fixture includes a zero-filled tail like BSS.
+    # Its ABI fields at offset 12 also make a mistaken get32(offset 12) fail.
+    struct.pack_into("<Q", image, 44, len(image) + PAGE_SIZE)
     image[116:148] = bytes(range(1, 33))
     for offset in range(256, len(image)):
         image[offset] = (offset * 131 + 17) & 0xFF
@@ -278,6 +280,27 @@ source = "readme.txt"
         if completed.returncode != 0:
             fail(f"rinpack rejected a valid RIN v3 header:\n{completed.stderr}")
         verify_rfim(package_path.read_bytes(), (directory / "main.rin").read_bytes())
+
+        oversized_image = bytearray(make_executable())
+        struct.pack_into("<Q", oversized_image, 44, RIN_MAX_IMAGE_SIZE + 1)
+        (directory / "oversized.rin").write_bytes(oversized_image)
+        oversized_manifest = directory / "oversized.toml"
+        oversized_manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                'source = "main.rin"', 'source = "oversized.rin"'
+            ),
+            encoding="utf-8",
+        )
+        rejected = subprocess.run(
+            [str(binary), "create", "--manifest", str(oversized_manifest),
+             "--output", str(directory / "oversized.rpk"),
+             "--sign-key", str(private_key), "--public-key", str(public_key),
+             "--publisher-generation", "1"],
+            cwd=ROOT, check=False, capture_output=True, text=True, timeout=30,
+        )
+        if rejected.returncode == 0 or \
+                "memory image size is outside loader bounds" not in rejected.stderr:
+            fail("rinpack did not fail closed on an oversized RIN v3 memory image")
     print("rinpack RFIM v2 executable page proofs passed")
     return 0
 
